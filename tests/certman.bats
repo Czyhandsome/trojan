@@ -384,7 +384,7 @@ EOF
   msmtp() { :; }
   systemctl() { :; }
   verify_health() { :; }
-  run_test_email() { :; }
+  deliver_test_email() { printf 'email\n' >>"$TEST_ROOT/adopt.log"; }
   install_self() { printf 'self\n' >>"$TEST_ROOT/adopt.log"; }
   install_systemd_units() { printf 'units\n' >>"$TEST_ROOT/adopt.log"; }
   download_manager() { return 89; }
@@ -395,6 +395,7 @@ EOF
   adopt_existing
   [ "$(grep -c '^self$' "$TEST_ROOT/adopt.log")" -eq 2 ]
   [ "$(grep -c '^units$' "$TEST_ROOT/adopt.log")" -eq 2 ]
+  [ "$(grep -c '^email$' "$TEST_ROOT/adopt.log")" -eq 2 ]
   grep -Fq 'ACME_MODE=standalone' "$CERTMAN_CONFIG_FILE"
 }
 

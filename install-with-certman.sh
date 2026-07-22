@@ -79,7 +79,7 @@ require_command() {
 }
 
 normalize_arch() {
-  case "${1:-$(uname -m)}" in
+  case "$1" in
     x86_64|amd64) printf 'amd64\n' ;;
     aarch64|arm64) printf 'arm64\n' ;;
     *) return 1 ;;
@@ -229,7 +229,7 @@ preflight_os() {
   version=${VERSION_ID:-}
   [[ "$version" == "22.04" || "$version" == "24.04" ]] || die "v1 supports Ubuntu 22.04 or 24.04"
   command -v systemctl >/dev/null 2>&1 || die "systemd is required"
-  arch=$(normalize_arch) || die "supported architectures: amd64, arm64"
+  arch=$(normalize_arch "$(uname -m)") || die "supported architectures: amd64, arm64"
   printf '%s\n' "$arch"
 }
 
@@ -517,11 +517,14 @@ verify_authoritative_dns_value() {
       if [[ "$expected" == absent ]]; then
         ((${#answers[@]} == 0)) || { all_match=0; break; }
       else
-        ((${#answers[@]} == 1)) && [[ "${answers[0]}" == "$expected" ]] || { all_match=0; break; }
+        if ((${#answers[@]} != 1)) || [[ "${answers[0]}" != "$expected" ]]; then
+          all_match=0
+          break
+        fi
       fi
     done
-    ((all_match == 1)) && return 0
-    ((SECONDS >= deadline)) && return 1
+    if ((all_match == 1)); then return 0; fi
+    if ((SECONDS >= deadline)); then return 1; fi
     sleep "$DNS_POLL_SECONDS"
   done
 }
@@ -597,12 +600,16 @@ configure_smtp() {
   write_msmtp_config
 }
 
-run_test_email() {
-  load_config
-  confirm "Send a test email to ${SMTP_RECIPIENT}?" || die "test email cancelled"
+deliver_test_email() {
   send_email "[trojan-certman] test from $(hostname -f 2>/dev/null || hostname)" \
     "Trojan certificate email alerting is configured for ${CERT_DOMAIN}." || die "test email failed"
   log "test email accepted by SMTP server"
+}
+
+run_test_email() {
+  load_config
+  confirm "Send a test email to ${SMTP_RECIPIENT}?" || die "test email cancelled"
+  deliver_test_email
 }
 
 adopt_existing() {
@@ -631,7 +638,9 @@ adopt_existing() {
   verify_health
   write_status success adopted
   log "existing installation adopted without DNS changes or certificate re-issuance"
-  confirm "Send the installation test email now?" && run_test_email || true
+  if confirm "Send the installation test email now?"; then
+    deliver_test_email
+  fi
 }
 
 install_new() {
