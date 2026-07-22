@@ -1,0 +1,31 @@
+name: certman-ci
+
+on:
+  pull_request:
+    paths:
+      - install-with-certman.sh
+      - tests/**
+      - .github/workflows/certman-ci.yml
+  push:
+    branches: [master]
+    paths:
+      - install-with-certman.sh
+      - tests/**
+      - .github/workflows/certman-ci.yml
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test tools
+        run: sudo apt-get update && sudo apt-get install -y bats shellcheck
+      - name: Parse shell
+        run: bash -n install-with-certman.sh
+      - name: ShellCheck
+        run: shellcheck -x install-with-certman.sh
+      - name: Bats
+        run: bats tests/certman.bats
