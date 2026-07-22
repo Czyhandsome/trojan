@@ -8,6 +8,69 @@
 
 trojan多用户管理部署程序
 
+## Czyhandsome fork：证书自动续期与换机安装
+
+本 fork 在不修改上游 Go 管理程序的前提下，提供一个独立的运维安装层：
+
+- 固定并校验 Jrohy `v2.15.3` 的 amd64/arm64 管理程序；
+- 新主机使用 Cloudflare DNS-01 申请证书，本地验证通过后才切换指定 A 记录；
+- 通过 systemd 每日检查续期，并验证磁盘证书、线上证书和服务状态；
+- 续期失败通过阿里企业邮箱 SMTP 发送限频告警；
+- 可接管已有安装，不重装 Trojan、不修改 DNS、不强制重新签发证书。
+
+> 这解决的是可重复安装和证书运维；固定在 2023 年发布的 `v2.15.3`，不等于完成了代理栈的安全现代化。
+
+### 支持范围
+
+- Ubuntu 22.04 / 24.04，systemd；
+- `x86_64` / `aarch64`；
+- 一个公网 IPv4 A 记录，Cloudflare DNS-only；
+- 首次 Trojan、MariaDB 和首用户初始化仍使用上游的交互式流程；
+- 不迁移或备份旧主机的用户数据库。
+
+### 新主机引导式安装
+
+建议先下载并查看脚本，再以 root 执行：
+
+```bash
+curl -fsSLo /tmp/install-with-certman.sh \
+  https://raw.githubusercontent.com/Czyhandsome/trojan/master/install-with-certman.sh
+less /tmp/install-with-certman.sh
+sudo bash /tmp/install-with-certman.sh install
+```
+
+脚本会静默读取 Cloudflare token 和 SMTP 三方客户端安全密码。秘密只写入 root 可读的
+`/etc/trojan-certman/secrets/`，不会写入仓库或命令参数。Cloudflare token 应仅授权
+`czyhandsome.ink` 的 `Zone:Read` 与 `DNS:Edit`。
+
+安装顺序是：签发 DNS-01 证书 → 完成上游交互初始化 → 验证本机 443 和测试邮件 → 最后更新
+`introspect.czyhandsome.ink`。切流前的 A 记录会保存下来，可显式回滚。
+
+### 接管现有主机
+
+```bash
+sudo bash /tmp/install-with-certman.sh adopt
+sudo trojan-certman status
+sudo trojan-certman renew
+```
+
+`adopt` 从现有 `/usr/local/etc/trojan/config.json` 读取域名和证书路径，只安装 timer 与告警。
+若现有证书是 standalone 模式，仅在进入 31 天续期窗口后临时停止 80 端口上的
+`trojan-web`；无论续期成功或失败都会恢复该服务。
+
+### 运维命令
+
+```text
+trojan-certman status
+trojan-certman renew
+trojan-certman test-email
+trojan-certman dns-rollback
+trojan-certman uninstall-automation
+```
+
+`renew` 永远不会隐式添加 `--force`。`uninstall-automation` 只删除 certman 的 timer、告警、
+配置和凭据，不删除 Trojan、MariaDB 或证书。
+
 ## 功能
 - 在线web页面和命令行两种方式管理trojan多用户
 - 启动 / 停止 / 重启 trojan 服务端
