@@ -167,6 +167,7 @@ seed_certificate_version() {
 
   [ "$(readlink "$XRAY_TLS_PREVIOUS")" = "$XRAY_TLS_VERSIONS/old" ]
   [ "$(certificate_fingerprint_file "$XRAY_TLS_CURRENT/fullchain.pem")" = "$(certificate_fingerprint_file "$TEST_ROOT/new.pem")" ]
+  [ "$(file_mode "$(readlink "$XRAY_TLS_CURRENT")")" = 750 ]
   [ "$(file_mode "$XRAY_TLS_CURRENT/private.key")" = 640 ]
   grep -Fq 'LAST_STAGE=certificate-deployed' "$STATUS_FILE"
 }

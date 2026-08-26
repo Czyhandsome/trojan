@@ -334,6 +334,7 @@ deploy_certificate_locked() {
   version_dir="${XRAY_TLS_VERSIONS}/${stamp}-${fingerprint}"
   [[ ! -e $version_dir ]] || version_dir="${version_dir}-$$"
   stage=$(mktemp -d "${XRAY_TLS_VERSIONS}/.stage.XXXXXX")
+  chmod 0750 "$stage"
   install -m 0644 "$source_cert" "$stage/fullchain.pem"
   install -m 0640 "$source_key" "$stage/private.key"
   safe_chown -R root:xray "$stage" 2>/dev/null || true
