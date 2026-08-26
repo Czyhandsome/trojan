@@ -57,6 +57,11 @@ file_mode() {
   stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
 }
 
+prepare_clean_install_roots() {
+  rm -rf -- "$CONFIG_DIR" "$STATE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_INSTALL_ROOT" \
+    "$MANAGED_ASSET_DIR" "$ROLLBACK_ROOT"
+}
+
 write_base_config() {
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
@@ -207,6 +212,7 @@ seed_certificate_version() {
 }
 
 @test "clean install succeeds and the identical second run preserves runtime state" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -349,6 +355,51 @@ seed_certificate_version() {
   [ "$(<"$CERTMAN_XRAY_INSTALL_ROOT/foreign-version/keep")" = foreign-state ]
 }
 
+@test "install rejects a foreign managed-root file without deleting it" {
+  prepare_clean_install_roots
+  printf '%s' foreign-root >"$CERTMAN_XRAY_INSTALL_ROOT"
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'partial or conflicting managed state'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+  [ "$(<"$CERTMAN_XRAY_INSTALL_ROOT")" = foreign-root ]
+}
+
+@test "install rejects a managed-root symlink without touching its target" {
+  prepare_clean_install_roots
+  mkdir -p "$TEST_ROOT/foreign-root-target"
+  printf '%s' foreign-target >"$TEST_ROOT/foreign-root-target/keep"
+  ln -s "$TEST_ROOT/foreign-root-target" "$CERTMAN_XRAY_INSTALL_ROOT"
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'partial or conflicting managed state'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+  [ -L "$CERTMAN_XRAY_INSTALL_ROOT" ]
+  [ "$(<"$TEST_ROOT/foreign-root-target/keep")" = foreign-target ]
+}
+
 @test "fresh-install health probing never sources an untrusted residual config" {
   printf '%s\n' \
     'CERT_DOMAIN=$(touch "'"$TEST_ROOT"'/config-executed")' \
@@ -372,6 +423,7 @@ seed_certificate_version() {
 }
 
 @test "install rejects missing secret inputs before installing dependencies" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   unset CERTMAN_PASSWORD_INPUT_FILE CERTMAN_CF_TOKEN_INPUT_FILE
@@ -386,6 +438,7 @@ seed_certificate_version() {
 }
 
 @test "install rejects an occupied 443 before installing dependencies" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -422,6 +475,7 @@ seed_certificate_version() {
 }
 
 @test "install rejects an unowned acme home before installing dependencies" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -441,6 +495,7 @@ seed_certificate_version() {
 }
 
 @test "install rejects a multiline secret before installing dependencies" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf 'first-line\nsecond-line\n' >"$TEST_ROOT/password-input"
@@ -458,6 +513,7 @@ seed_certificate_version() {
 }
 
 @test "failed fresh install cleans managed state but preserves dependencies and xray user" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -510,6 +566,7 @@ seed_certificate_version() {
 }
 
 @test "fresh cleanup treats absent systemd units as already clean" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -532,6 +589,7 @@ seed_certificate_version() {
 }
 
 @test "failed fresh install removes an acme home created by the transaction" {
+  prepare_clean_install_roots
   CERT_DOMAIN=example.com
   TROJAN_PORT=443
   printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
@@ -1130,6 +1188,7 @@ EOF
   systemctl() {
     printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"
     printf '\n' >>"$TEST_ROOT/systemctl.log"
+    if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi
     return 0
   }
 
@@ -1138,6 +1197,39 @@ EOF
   grep -Fxq 'disable|--now|trojan-web.service|' "$TEST_ROOT/systemctl.log"
   ! grep -Eq '^(enable|start)\|trojan-web\.service\|' "$TEST_ROOT/systemctl.log"
   grep -Fxq 'CUTOVER_ACTIVE=0' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
+}
+
+@test "legacy rollback stays incomplete while the retired Web manager is active" {
+  mkdir -p "$CERTMAN_LEGACY_MIGRATION_DIR/files/systemd"
+  printf '%s\n' '{"canary":true}' >"$CERTMAN_LEGACY_MIGRATION_DIR/xray-canary.json"
+  printf '%s\n' 'CERT_DOMAIN=example.com' 'TROJAN_PORT=18443' \
+    'ACME_CERT_FILE=/missing/cert' 'ACME_KEY_FILE=/missing/key' \
+    >"$CERTMAN_LEGACY_MIGRATION_DIR/certman-canary.config"
+  cat >"$CERTMAN_LEGACY_MIGRATION_DIR/manifest" <<'EOF'
+CUTOVER_ACTIVE=1
+TROJAN_ACTIVE=0
+TROJAN_ENABLED=0
+RENEW_ACTIVE=0
+RENEW_ENABLED=0
+SOMAXCONN=128
+SYN_BACKLOG=128
+HAD_SYSCTL_FILE=0
+HAD_ACME_HOME=0
+LEGACY_CONFIG_MODE=600
+EOF
+  restore_legacy_units() { :; }
+  sysctl() { return 0; }
+  verify_live_certificate() { return 0; }
+  systemctl() {
+    if [[ $1 == is-active && ${3:-} == trojan-web.service ]]; then return 0; fi
+    if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi
+    return 0
+  }
+
+  run rollback_legacy_locked
+
+  [ "$status" -ne 0 ]
+  grep -Fxq 'CUTOVER_ACTIVE=1' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
 }
 
 @test "systemd assets enforce non-root Xray hardening and scheduled snapshots" {

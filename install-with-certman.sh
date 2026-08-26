@@ -826,8 +826,7 @@ managed_state_exists() {
   done
   for root in "$CONFIG_DIR" "$STATE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_INSTALL_ROOT" \
       "$MANAGED_ASSET_DIR" "$ROLLBACK_ROOT"; do
-    [[ -d $root ]] || continue
-    find "$root" -mindepth 1 ! -type d -print -quit 2>/dev/null | grep -q . && return 0
+    [[ -e $root || -L $root ]] && return 0
   done
   for unit in "${SYSTEMD_UNITS[@]}"; do
     [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]] && return 0
@@ -1104,6 +1103,12 @@ restore_legacy_units() {
   systemctl daemon-reload
 }
 
+disable_legacy_web() {
+  systemctl disable --now trojan-web.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet trojan-web.service >/dev/null 2>&1; then return 1; fi
+  if systemctl is-enabled --quiet trojan-web.service >/dev/null 2>&1; then return 1; fi
+}
+
 rollback_legacy_locked() {
   local manifest=$LEGACY_MIGRATION_DIR/manifest failed_acme rc=0
   local TROJAN_ACTIVE=0 TROJAN_ENABLED=0
@@ -1111,7 +1116,7 @@ rollback_legacy_locked() {
   [[ -r $manifest ]] || return 1
   # shellcheck disable=SC1090
   source "$manifest"
-  systemctl disable --now trojan-web.service >/dev/null 2>&1 || true
+  disable_legacy_web || rc=1
   systemctl disable --now trojan-certman-renew.timer trojan-certman-snapshot.timer >/dev/null 2>&1 || true
   systemctl stop xray.service >/dev/null 2>&1 || true
   cp -a "$LEGACY_MIGRATION_DIR/xray-canary.json" "$XRAY_CONFIG" || rc=1
@@ -1178,7 +1183,8 @@ finalize_cutover() {
   install_systemd_units || return 1
   configure_capacity || return 1
   chmod 0600 "$LEGACY_CONFIG" 2>/dev/null || true
-  systemctl disable trojan.service trojan-web.service >/dev/null 2>&1 || true
+  systemctl disable trojan.service >/dev/null 2>&1 || true
+  disable_legacy_web || return 1
   systemctl enable xray.service trojan-certman-renew.timer trojan-certman-snapshot.timer || return 1
   systemctl start trojan-certman-renew.timer trojan-certman-snapshot.timer || return 1
 }
