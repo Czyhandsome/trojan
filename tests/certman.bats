@@ -86,6 +86,19 @@ seed_certificate_version() {
   grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
 
+@test "Xray version check consumes full output without pipefail SIGPIPE" {
+  local fake_xray="$TEST_ROOT/fake-xray"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'printf "Xray 26.3.27 (Xray, Penetrates Everything.)\\n"' \
+    'for _ in {1..10000}; do printf "version-detail-padding\\n"; done' >"$fake_xray"
+  chmod 0755 "$fake_xray"
+
+  xray_binary_matches_version "$fake_xray" v26.3.27
+  run xray_binary_matches_version "$fake_xray" v99.0.0
+  [ "$status" -ne 0 ]
+}
+
 @test "generated Xray config has one Trojan client and no fallback" {
   write_base_config
   [ "$(jq -r '.inbounds[0].protocol' "$XRAY_CONFIG")" = trojan ]

@@ -345,6 +345,12 @@ download_xray_archive() {
   curl -fL --proto '=https' --tlsv1.2 "${XRAY_RELEASE_BASE}/${version}/${asset}" -o "$target"
 }
 
+xray_binary_matches_version() {
+  local binary=$1 version=$2 output
+  output=$("$binary" version 2>&1) || return 1
+  [[ $output == *"${version#v}"* ]]
+}
+
 install_xray_release() {
   local version=$1 supplied_sha=$2 activate=${3:-1} arch asset expected stage archive extracted final old_target actual
   [[ $version == "$XRAY_VERSION" ]] || die "unsupported Xray version: $version"
@@ -357,7 +363,7 @@ install_xray_release() {
   if [[ -e $final ]]; then
     [[ -x $final/xray && -r $final/.archive.sha256 ]] || die 'existing Xray version directory is incomplete'
     [[ $(<"$final/.archive.sha256") == "$expected" ]] || die 'existing Xray version directory has an untrusted checksum marker'
-    "$final/xray" version | grep -Fq "${version#v}" || die 'existing Xray binary version does not match'
+    xray_binary_matches_version "$final/xray" "$version" || die 'existing Xray binary version does not match'
   else
     stage=$(mktemp -d "${XRAY_VERSIONS_DIR}/.stage.XXXXXX")
     archive="$stage/$asset"
@@ -368,7 +374,8 @@ install_xray_release() {
     install -d -m 0755 "$extracted"
     unzip -q "$archive" -d "$extracted"
     [[ -x $extracted/xray ]] || { rm -rf -- "$stage"; die 'Xray archive does not contain an executable xray'; }
-    "$extracted/xray" version | grep -Fq "${version#v}" || { rm -rf -- "$stage"; die 'Xray binary version does not match requested version'; }
+    xray_binary_matches_version "$extracted/xray" "$version" \
+      || { rm -rf -- "$stage"; die 'Xray binary version does not match requested version'; }
     rm -f -- "$archive"
     printf '%s\n' "$expected" >"$extracted/.archive.sha256"
     chmod 0644 "$extracted/.archive.sha256"
