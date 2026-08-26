@@ -115,7 +115,9 @@ atomic_symlink() {
   if mv --help >/dev/null 2>&1; then mv -Tf "$temp" "$link"; else mv -fh "$temp" "$link"; fi
 }
 
-read_link_or_empty() { [[ -L $1 ]] && readlink "$1" || true; }
+read_link_or_empty() {
+  if [[ -L $1 ]]; then readlink "$1"; fi
+}
 
 install_secret_file() {
   local target=$1 input=$2 temp
@@ -212,7 +214,7 @@ current_key_file() { printf '%s/private.key\n' "$XRAY_TLS_CURRENT"; }
 
 verify_live_certificate() {
   local expected live temp
-  expected=${1:-$(current_cert_file)}
+  expected=$(current_cert_file)
   temp=$(mktemp)
   if ! timeout 15 openssl s_client -connect "127.0.0.1:${TROJAN_PORT}" -servername "$CERT_DOMAIN" </dev/null 2>/dev/null \
       | openssl x509 -outform PEM >"$temp" 2>/dev/null; then
@@ -761,7 +763,9 @@ rollback_legacy_locked() {
   if [[ ${HAD_ACME_HOME:-0} == 1 ]]; then
     cp -a "$LEGACY_MIGRATION_DIR/files/acme-home" "$ACME_HOME" || rc=1
   fi
-  [[ ${LEGACY_CONFIG_MODE:-unknown} =~ ^[0-7]{3,4}$ ]] && chmod "$LEGACY_CONFIG_MODE" "$LEGACY_CONFIG" 2>/dev/null || true
+  if [[ ${LEGACY_CONFIG_MODE:-unknown} =~ ^[0-7]{3,4}$ ]]; then
+    chmod "$LEGACY_CONFIG_MODE" "$LEGACY_CONFIG" 2>/dev/null || true
+  fi
   if [[ ${TROJAN_ENABLED:-0} == 1 ]]; then systemctl enable trojan.service >/dev/null 2>&1 || rc=1; fi
   if [[ ${WEB_ENABLED:-0} == 1 ]]; then systemctl enable trojan-web.service >/dev/null 2>&1 || rc=1; fi
   if [[ ${TROJAN_ACTIVE:-0} == 1 ]]; then systemctl start trojan.service || rc=1; fi
