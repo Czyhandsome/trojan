@@ -84,6 +84,7 @@ seed_certificate_version() {
   [ "$ACME_TARBALL_SHA256" = 9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884 ]
   [ "$ACME_SCRIPT_SHA256" = 8a32aeb017c71929e3f5b9ad804ced2b629e2b28ea50797fb2f8e7678e681997 ]
   grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
+  grep -Fq -- 'NO_DETECT_SH=1' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
 
 @test "Xray version check consumes full output without pipefail SIGPIPE" {

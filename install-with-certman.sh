@@ -478,7 +478,7 @@ install_pinned_acme() {
   tar -xzf "$archive" -C "$stage"
   source="$stage/acme.sh-${ACME_COMMIT}"
   [[ -x $source/acme.sh ]] || { rm -rf -- "$stage"; die 'acme.sh archive layout mismatch'; }
-  (cd "$source" && ./acme.sh --install --home "$ACME_HOME" --no-cron --no-profile)
+  (cd "$source" && NO_DETECT_SH=1 ./acme.sh --install --home "$ACME_HOME" --no-cron --no-profile)
   rm -rf -- "$stage"
   [[ -x $ACME_BIN ]] || die 'pinned acme.sh installation failed'
   installed_sha=$(sha256sum "$ACME_BIN" | awk '{print $1}')
