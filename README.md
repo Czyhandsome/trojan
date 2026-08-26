@@ -22,6 +22,8 @@ Clash 兼容 canary，不能只看配置语法通过。
 - Ubuntu 22.04 / 24.04，systemd，`x86_64` / `aarch64`。
 - 单域名、单节点、单个 Trojan 凭据；不提供通用多用户面板。
 - Xray 配置固定在 `/etc/xray/config.json`，权限为 `0640 root:xray`。
+- 安装后的 CLI 从 `/usr/local/lib/trojan-certman-v3/asset` 读取固定的 systemd unit，
+  不依赖仓库目录继续存在。
 - Trojan 密码和 Cloudflare token 不得进入仓库、命令行参数或日志；通过 root 可读输入文件读取。
 - Xray 以专用 `xray` 用户运行，只保留绑定 443 所需能力，并由 systemd 应用
   `NoNewPrivileges`、只读系统目录、私有临时目录和内核保护。

@@ -42,7 +42,21 @@ SYSTEMD_DIR=${CERTMAN_SYSTEMD_DIR:-/etc/systemd/system}
 SYSCTL_FILE=${CERTMAN_SYSCTL_FILE:-/etc/sysctl.d/90-trojan-xray-capacity.conf}
 INSTALLED_BIN=${CERTMAN_INSTALLED_BIN:-/usr/local/sbin/trojan-certman}
 STAGED_BIN=${CERTMAN_STAGED_BIN:-/usr/local/sbin/trojan-certman-v3}
-ASSET_DIR=${CERTMAN_ASSET_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/asset}
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+MANAGED_ASSET_DIR=${CERTMAN_MANAGED_ASSET_DIR:-/usr/local/lib/trojan-certman-v3/asset}
+if [[ -d $SCRIPT_DIR/asset ]]; then
+  DEFAULT_ASSET_DIR=$SCRIPT_DIR/asset
+else
+  DEFAULT_ASSET_DIR=$MANAGED_ASSET_DIR
+fi
+ASSET_DIR=${CERTMAN_ASSET_DIR:-$DEFAULT_ASSET_DIR}
+SYSTEMD_UNITS=(
+  xray.service
+  trojan-certman-renew.service
+  trojan-certman-renew.timer
+  trojan-certman-snapshot.service
+  trojan-certman-snapshot.timer
+)
 
 ACME_HOME=${CERTMAN_ACME_HOME:-/root/.acme.sh}
 ACME_BIN=${CERTMAN_ACME_BIN:-${ACME_HOME}/acme.sh}
@@ -581,7 +595,7 @@ show_status() {
 
 install_systemd_units() {
   local unit
-  for unit in xray.service trojan-certman-renew.service trojan-certman-renew.timer trojan-certman-snapshot.service trojan-certman-snapshot.timer; do
+  for unit in "${SYSTEMD_UNITS[@]}"; do
     [[ -r $ASSET_DIR/$unit ]] || die "missing systemd asset: $ASSET_DIR/$unit"
     install -m 0644 "$ASSET_DIR/$unit" "$SYSTEMD_DIR/$unit"
   done
@@ -619,8 +633,22 @@ configure_capacity() {
 install_self() {
   local source target=${1:-$INSTALLED_BIN}
   source=$(readlink -f "${BASH_SOURCE[0]}")
+  install_managed_assets
   install -d -m 0755 "$(dirname "$target")"
   install -m 0755 "$source" "$target"
+}
+
+install_managed_assets() {
+  local unit
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    [[ -r $ASSET_DIR/$unit ]] || die "missing systemd asset: $ASSET_DIR/$unit"
+  done
+  [[ $ASSET_DIR == "$MANAGED_ASSET_DIR" ]] && return 0
+  install -d -m 0755 "$MANAGED_ASSET_DIR"
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    install -m 0644 "$ASSET_DIR/$unit" "$MANAGED_ASSET_DIR/$unit"
+  done
+  safe_chown -R root:root "$MANAGED_ASSET_DIR" 2>/dev/null || true
 }
 
 create_xray_user() {

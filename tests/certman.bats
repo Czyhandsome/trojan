@@ -33,6 +33,7 @@ setup() {
   export CERTMAN_SYSCTL_FILE="$TEST_ROOT/etc/sysctl.d/90-trojan-xray-capacity.conf"
   export CERTMAN_INSTALLED_BIN="$TEST_ROOT/usr/local/sbin/trojan-certman"
   export CERTMAN_STAGED_BIN="$TEST_ROOT/usr/local/sbin/trojan-certman-v3"
+  export CERTMAN_MANAGED_ASSET_DIR="$TEST_ROOT/usr/local/lib/trojan-certman-v3/asset"
   export CERTMAN_ASSET_DIR="$BATS_TEST_DIRNAME/../asset"
   export CERTMAN_ACME_HOME="$TEST_ROOT/root/.acme.sh"
   export CERTMAN_ACME_BIN="$CERTMAN_ACME_HOME/acme.sh"
@@ -85,6 +86,25 @@ seed_certificate_version() {
   [ "$ACME_SCRIPT_SHA256" = fcabf274d4f96966ec933879ae0257266e8ef2f7d16161f14b84dd896c0cac32 ]
   grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
   grep -Fq -- 'NO_DETECT_SH=1' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
+}
+
+@test "installed CLI resolves packaged systemd assets without the repository" {
+  install_self "$CERTMAN_STAGED_BIN"
+
+  [ -r "$CERTMAN_MANAGED_ASSET_DIR/xray.service" ]
+  run env -u CERTMAN_ASSET_DIR \
+    CERTMAN_MANAGED_ASSET_DIR="$CERTMAN_MANAGED_ASSET_DIR" \
+    CERTMAN_SYSTEMD_DIR="$CERTMAN_SYSTEMD_DIR" \
+    bash -c '
+      source "$1"
+      systemctl() { :; }
+      [[ $ASSET_DIR == "$CERTMAN_MANAGED_ASSET_DIR" ]]
+      install_systemd_units
+    ' _ "$CERTMAN_STAGED_BIN"
+
+  [ "$status" -eq 0 ]
+  [ -r "$CERTMAN_SYSTEMD_DIR/xray.service" ]
+  [ -r "$CERTMAN_SYSTEMD_DIR/trojan-certman-renew.timer" ]
 }
 
 @test "Xray version check consumes full output without pipefail SIGPIPE" {
