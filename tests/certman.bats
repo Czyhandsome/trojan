@@ -82,7 +82,7 @@ seed_certificate_version() {
   [ "$XRAY_ARM64_SHA256" = 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ]
   [ "$ACME_VERSION" = 3.1.4 ]
   [ "$ACME_TARBALL_SHA256" = 9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884 ]
-  [ "$ACME_SCRIPT_SHA256" = 8a32aeb017c71929e3f5b9ad804ced2b629e2b28ea50797fb2f8e7678e681997 ]
+  [ "$ACME_SCRIPT_SHA256" = fcabf274d4f96966ec933879ae0257266e8ef2f7d16161f14b84dd896c0cac32 ]
   grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
   grep -Fq -- 'NO_DETECT_SH=1' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }

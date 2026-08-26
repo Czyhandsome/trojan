@@ -119,6 +119,7 @@ jobs:
           xray_version=$(constant XRAY_VERSION)
           acme_commit=$(constant ACME_COMMIT)
           acme_sha256=$(constant ACME_TARBALL_SHA256)
+          acme_script_sha256=$(constant ACME_SCRIPT_SHA256)
           stage="$RUNNER_TEMP/release-assets"
           install -d "$stage"
 
@@ -139,6 +140,15 @@ jobs:
             "https://github.com/acmesh-official/acme.sh/archive/${acme_commit}.tar.gz" \
             -o "$stage/acme.sh.tar.gz"
           printf '%s  %s\n' "$acme_sha256" "$stage/acme.sh.tar.gz" \
+            | sha256sum --check --strict
+
+          tar -xzf "$stage/acme.sh.tar.gz" -C "$stage"
+          acme_source="$stage/acme.sh-${acme_commit}"
+          printf '%s  %s\n' "$acme_script_sha256" "$acme_source/acme.sh" \
+            | sha256sum --check --strict
+          (cd "$acme_source" && HOME="$stage/home" NO_DETECT_SH=1 ./acme.sh \
+            --install --home "$stage/acme-home" --no-cron --no-profile)
+          printf '%s  %s\n' "$acme_script_sha256" "$stage/acme-home/acme.sh" \
             | sha256sum --check --strict
 
       - name: Check Xray Trojan inbound compatibility
