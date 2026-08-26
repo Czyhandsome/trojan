@@ -1127,12 +1127,16 @@ EOF
   restore_legacy_units() { :; }
   sysctl() { return 0; }
   verify_live_certificate() { return 0; }
-  systemctl() { printf '%s\n' "$*" >>"$TEST_ROOT/systemctl.log"; return 0; }
+  systemctl() {
+    printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"
+    printf '\n' >>"$TEST_ROOT/systemctl.log"
+    return 0
+  }
 
   rollback_legacy_locked
 
-  grep -Fxq 'disable --now trojan-web.service' "$TEST_ROOT/systemctl.log"
-  ! grep -Eq '^(enable|start) trojan-web\.service($| )' "$TEST_ROOT/systemctl.log"
+  grep -Fxq 'disable|--now|trojan-web.service|' "$TEST_ROOT/systemctl.log"
+  ! grep -Eq '^(enable|start)\|trojan-web\.service\|' "$TEST_ROOT/systemctl.log"
   grep -Fxq 'CUTOVER_ACTIVE=0' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
 }
 
