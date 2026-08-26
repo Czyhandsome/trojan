@@ -233,8 +233,10 @@ xray_config_test() {
 }
 
 candidate_config_test() {
-  local cert=$1 key=$2 temp
-  temp=$(mktemp "${XRAY_CONFIG_DIR}/.candidate.XXXXXX")
+  local cert=$1 key=$2 temp temp_base
+  temp_base=$(mktemp "${XRAY_CONFIG_DIR}/.candidate.XXXXXX")
+  temp="${temp_base}.json"
+  mv "$temp_base" "$temp"
   jq --arg cert "$cert" --arg key "$key" \
     '.inbounds[0].streamSettings.tlsSettings.certificates[0].certificateFile=$cert |
      .inbounds[0].streamSettings.tlsSettings.certificates[0].keyFile=$key' "$XRAY_CONFIG" >"$temp"

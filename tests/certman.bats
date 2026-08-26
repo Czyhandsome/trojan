@@ -120,6 +120,19 @@ seed_certificate_version() {
   [ "$before" = "$after" ]
 }
 
+@test "candidate Xray config keeps a json suffix for format detection" {
+  write_base_config
+  xray_config_test() {
+    printf '%s' "$2" >"$TEST_ROOT/candidate-path"
+    return 0
+  }
+
+  candidate_config_test "$TEST_ROOT/candidate.pem" "$TEST_ROOT/candidate.key"
+
+  [[ $(<"$TEST_ROOT/candidate-path") == *.json ]]
+  [ ! -e "$(<"$TEST_ROOT/candidate-path")" ]
+}
+
 @test "certificate validation enforces lifetime SAN and key match" {
   make_certificate 30 example.com "$TEST_ROOT/good.key" "$TEST_ROOT/good.pem"
   verify_certificate_pair "$TEST_ROOT/good.pem" "$TEST_ROOT/good.key" example.com
