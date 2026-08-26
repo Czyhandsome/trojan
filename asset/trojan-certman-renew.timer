@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily personal Trojan certificate renewal check
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+Unit=trojan-certman-renew.service
+
+[Install]
+WantedBy=timers.target

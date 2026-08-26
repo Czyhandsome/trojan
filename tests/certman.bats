@@ -2,32 +2,41 @@
 
 setup() {
   export TEST_ROOT="$BATS_TEST_TMPDIR/root"
-  mkdir -p "$TEST_ROOT/etc/trojan-certman/secrets" \
-    "$TEST_ROOT/var/lib/trojan-certman" \
-    "$TEST_ROOT/etc/systemd/system" \
-    "$TEST_ROOT/etc/trojan/tls" \
-    "$TEST_ROOT/root/.acme.sh/example.com_ecc" \
-    "$TEST_ROOT/run/lock"
+  mkdir -p "$TEST_ROOT/etc/trojan-certman/secrets" "$TEST_ROOT/var/lib/trojan-certman" \
+    "$TEST_ROOT/etc/xray/tls/versions" "$TEST_ROOT/usr/local/lib/xray/versions" \
+    "$TEST_ROOT/usr/local/bin" "$TEST_ROOT/etc/systemd/system" "$TEST_ROOT/run/lock" \
+    "$TEST_ROOT/root/.acme.sh"
   export CERTMAN_CONFIG_DIR="$TEST_ROOT/etc/trojan-certman"
   export CERTMAN_CONFIG_FILE="$CERTMAN_CONFIG_DIR/config"
   export CERTMAN_SECRETS_DIR="$CERTMAN_CONFIG_DIR/secrets"
+  export CERTMAN_PASSWORD_FILE="$CERTMAN_SECRETS_DIR/trojan-password"
   export CERTMAN_CF_TOKEN_FILE="$CERTMAN_SECRETS_DIR/cloudflare-token"
-  export CERTMAN_SMTP_PASSWORD_FILE="$CERTMAN_SECRETS_DIR/smtp-password"
-  export CERTMAN_MSMTP_CONFIG="$CERTMAN_CONFIG_DIR/msmtprc"
   export CERTMAN_STATE_DIR="$TEST_ROOT/var/lib/trojan-certman"
   export CERTMAN_STATUS_FILE="$CERTMAN_STATE_DIR/status"
-  export CERTMAN_DNS_BACKUP_FILE="$CERTMAN_STATE_DIR/dns-before.json"
+  export CERTMAN_ROLLBACK_ROOT="$CERTMAN_STATE_DIR/rollback"
+  export CERTMAN_LEGACY_MIGRATION_DIR="$CERTMAN_STATE_DIR/legacy-migration"
   export CERTMAN_LOCK_FILE="$TEST_ROOT/run/lock/trojan-certman.lock"
+  export CERTMAN_XRAY_CONFIG_DIR="$TEST_ROOT/etc/xray"
+  export CERTMAN_XRAY_CONFIG="$CERTMAN_XRAY_CONFIG_DIR/config.json"
+  export CERTMAN_XRAY_TLS_ROOT="$CERTMAN_XRAY_CONFIG_DIR/tls"
+  export CERTMAN_XRAY_TLS_VERSIONS="$CERTMAN_XRAY_TLS_ROOT/versions"
+  export CERTMAN_XRAY_TLS_CURRENT="$CERTMAN_XRAY_TLS_ROOT/current"
+  export CERTMAN_XRAY_TLS_PREVIOUS="$CERTMAN_XRAY_TLS_ROOT/previous"
+  export CERTMAN_XRAY_INSTALL_ROOT="$TEST_ROOT/usr/local/lib/xray"
+  export CERTMAN_XRAY_VERSIONS_DIR="$CERTMAN_XRAY_INSTALL_ROOT/versions"
+  export CERTMAN_XRAY_CURRENT="$CERTMAN_XRAY_INSTALL_ROOT/current"
+  export CERTMAN_XRAY_PREVIOUS="$CERTMAN_XRAY_INSTALL_ROOT/previous"
+  export CERTMAN_XRAY_BIN="$TEST_ROOT/usr/local/bin/xray"
+  export CERTMAN_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
+  export CERTMAN_SYSCTL_FILE="$TEST_ROOT/etc/sysctl.d/90-trojan-xray-capacity.conf"
+  export CERTMAN_INSTALLED_BIN="$TEST_ROOT/usr/local/sbin/trojan-certman"
+  export CERTMAN_STAGED_BIN="$TEST_ROOT/usr/local/sbin/trojan-certman-v3"
+  export CERTMAN_ASSET_DIR="$BATS_TEST_DIRNAME/../asset"
   export CERTMAN_ACME_HOME="$TEST_ROOT/root/.acme.sh"
   export CERTMAN_ACME_BIN="$CERTMAN_ACME_HOME/acme.sh"
-  export CERTMAN_TROJAN_CONFIG="$TEST_ROOT/usr/local/etc/trojan/config.json"
-  export CERTMAN_TROJAN_TLS_DIR="$TEST_ROOT/etc/trojan/tls"
-  export CERTMAN_SYSTEMD_DIR="$TEST_ROOT/etc/systemd/system"
-  export CERTMAN_INSTALLED_BIN="$TEST_ROOT/usr/local/sbin/trojan-certman"
-  export CERTMAN_DNS_WAIT_SECONDS=0
-  export CERTMAN_DNS_POLL_SECONDS=0
+  export CERTMAN_LEGACY_CONFIG="$TEST_ROOT/legacy.json"
   export CERTMAN_SKIP_ROOT_CHECK=1
-  export CERTMAN_ASSUME_YES=1
+  export CERTMAN_SKIP_CHOWN=1
   # shellcheck source=../install-with-certman.sh
   source "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
@@ -39,416 +48,418 @@ make_certificate() {
     -keyout "$key" -out "$cert" >/dev/null 2>&1
 }
 
-@test "architecture normalization is pinned to supported release assets" {
+file_mode() {
+  stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"
+}
+
+write_base_config() {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' 'fixture-personal-credential' >"$PASSWORD_FILE"
+  chmod 0600 "$PASSWORD_FILE"
+  write_config
+  write_xray_config
+}
+
+seed_certificate_version() {
+  local name=$1 cert=$2 key=$3 target
+  target="$XRAY_TLS_VERSIONS/$name"
+  mkdir -p "$target"
+  cp "$cert" "$target/fullchain.pem"
+  cp "$key" "$target/private.key"
+  atomic_symlink "$target" "$XRAY_TLS_CURRENT"
+}
+
+@test "release manifest pins Xray for amd64 and arm64 plus acme.sh" {
   [ "$(normalize_arch x86_64)" = amd64 ]
   [ "$(normalize_arch aarch64)" = arm64 ]
   run normalize_arch riscv64
   [ "$status" -ne 0 ]
-  [ "$UPSTREAM_AMD64_SHA256" = 3acd0b3fbe51aaf56ec482370c63d4832fd9deec534bcfea8922fffd7b03b98c ]
-  [ "$UPSTREAM_ARM64_SHA256" = b8a8a4d8afc6307f4ee954ed52d5aecc8ee70932c0a16ab8d504be39ea164f59 ]
+  [ "$XRAY_VERSION" = v26.3.27 ]
+  [ "$XRAY_AMD64_SHA256" = 23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae ]
+  [ "$XRAY_ARM64_SHA256" = 4d30283ae614e3057f730f67cd088a42be6fdf91f8639d82cb69e48cde80413c ]
+  [ "$ACME_VERSION" = 3.1.4 ]
+  [ "$ACME_TARBALL_SHA256" = 9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884 ]
+  [ "$ACME_SCRIPT_SHA256" = 8a32aeb017c71929e3f5b9ad804ced2b629e2b28ea50797fb2f8e7678e681997 ]
+  grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
 
-@test "IPv4 validation rejects malformed and out-of-range addresses" {
-  valid_ipv4 23.95.133.118
-  run valid_ipv4 256.1.1.1
+@test "generated Xray config has one Trojan client and no fallback" {
+  write_base_config
+  [ "$(jq -r '.inbounds[0].protocol' "$XRAY_CONFIG")" = trojan ]
+  [ "$(jq '.inbounds[0].settings.clients | length' "$XRAY_CONFIG")" -eq 1 ]
+  [ "$(jq -r '.inbounds[0].settings.clients[0].password' "$XRAY_CONFIG")" = fixture-personal-credential ]
+  [ "$(jq -r '.inbounds[0].settings.fallbacks // empty' "$XRAY_CONFIG")" = '' ]
+  [ "$(jq -r '.routing.domainStrategy' "$XRAY_CONFIG")" = IPIfNonMatch ]
+  [ "$(jq '[.routing.rules[] | select(.outboundTag == "blocked") | .ip[] | select(. == "100.64.0.0/10")] | length' "$XRAY_CONFIG")" -eq 1 ]
+  [ "$(jq '[.routing.rules[] | select(.outboundTag == "blocked") | .ip[] | select(. == "169.254.0.0/16")] | length' "$XRAY_CONFIG")" -eq 1 ]
+  [ "$(file_mode "$XRAY_CONFIG")" = 640 ]
+  ! grep -Fq fixture-personal-credential "$CONFIG_FILE"
+}
+
+@test "rewriting config with the same input is idempotent" {
+  write_base_config
+  before=$(sha256sum "$XRAY_CONFIG" | awk '{print $1}')
+  write_xray_config
+  after=$(sha256sum "$XRAY_CONFIG" | awk '{print $1}')
+  [ "$before" = "$after" ]
+}
+
+@test "certificate validation enforces lifetime SAN and key match" {
+  make_certificate 30 example.com "$TEST_ROOT/good.key" "$TEST_ROOT/good.pem"
+  verify_certificate_pair "$TEST_ROOT/good.pem" "$TEST_ROOT/good.key" example.com
+  make_certificate 1 example.com "$TEST_ROOT/short.key" "$TEST_ROOT/short.pem"
+  run verify_certificate_pair "$TEST_ROOT/short.pem" "$TEST_ROOT/short.key" example.com
   [ "$status" -ne 0 ]
-  run valid_ipv4 not-an-ip
+  make_certificate 30 wrong.example "$TEST_ROOT/wrong.key" "$TEST_ROOT/wrong.pem"
+  run verify_certificate_pair "$TEST_ROOT/wrong.pem" "$TEST_ROOT/wrong.key" example.com
+  [ "$status" -ne 0 ]
+  make_certificate 30 example.com.attacker "$TEST_ROOT/prefix.key" "$TEST_ROOT/prefix.pem"
+  run verify_certificate_pair "$TEST_ROOT/prefix.pem" "$TEST_ROOT/prefix.key" example.com
+  [ "$status" -ne 0 ]
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj '/CN=example.com' \
+    -keyout "$TEST_ROOT/cn-only.key" -out "$TEST_ROOT/cn-only.pem" >/dev/null 2>&1
+  run verify_certificate_pair "$TEST_ROOT/cn-only.pem" "$TEST_ROOT/cn-only.key" example.com
+  [ "$status" -ne 0 ]
+  make_certificate 30 example.com "$TEST_ROOT/mismatch.key" "$TEST_ROOT/mismatch.pem"
+  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TEST_ROOT/mismatch.key" >/dev/null 2>&1
+  run verify_certificate_pair "$TEST_ROOT/mismatch.pem" "$TEST_ROOT/mismatch.key" example.com
   [ "$status" -ne 0 ]
 }
 
-@test "public IPv4 validation rejects private and reserved ranges" {
-  public_ipv4 23.95.133.118
-  run public_ipv4 10.0.0.1
-  [ "$status" -ne 0 ]
-  run public_ipv4 100.64.0.1
-  [ "$status" -ne 0 ]
-  run public_ipv4 192.168.1.1
-  [ "$status" -ne 0 ]
-  run public_ipv4 203.0.113.10
-  [ "$status" -ne 0 ]
+@test "deploy-cert atomically advances current and previous" {
+  write_base_config
+  make_certificate 30 example.com "$TEST_ROOT/old.key" "$TEST_ROOT/old.pem"
+  make_certificate 60 example.com "$TEST_ROOT/new.key" "$TEST_ROOT/new.pem"
+  seed_certificate_version old "$TEST_ROOT/old.pem" "$TEST_ROOT/old.key"
+  candidate_config_test() { return 0; }
+  restart_and_verify_xray() { return 0; }
+
+  deploy_certificate_locked "$TEST_ROOT/new.pem" "$TEST_ROOT/new.key"
+
+  [ "$(readlink "$XRAY_TLS_PREVIOUS")" = "$XRAY_TLS_VERSIONS/old" ]
+  [ "$(certificate_fingerprint_file "$XRAY_TLS_CURRENT/fullchain.pem")" = "$(certificate_fingerprint_file "$TEST_ROOT/new.pem")" ]
+  [ "$(file_mode "$XRAY_TLS_CURRENT/private.key")" = 640 ]
+  grep -Fq 'LAST_STAGE=certificate-deployed' "$STATUS_FILE"
 }
 
-@test "generated config is non-secret and msmtp uses a password file" {
+@test "deploy-cert is a no-op when the same valid certificate is already live" {
+  write_base_config
+  make_certificate 30 example.com "$TEST_ROOT/current.key" "$TEST_ROOT/current.pem"
+  seed_certificate_version current "$TEST_ROOT/current.pem" "$TEST_ROOT/current.key"
+  xray_config_test() { return 0; }
+  verify_live_certificate() { return 0; }
+  restart_and_verify_xray() { printf restarted >"$TEST_ROOT/restarted"; return 0; }
+
+  deploy_certificate_locked "$TEST_ROOT/current.pem" "$TEST_ROOT/current.key"
+
+  [ "$(readlink "$XRAY_TLS_CURRENT")" = "$XRAY_TLS_VERSIONS/current" ]
+  [ ! -e "$XRAY_TLS_PREVIOUS" ]
+  [ ! -e "$TEST_ROOT/restarted" ]
+  grep -Fq 'LAST_STAGE=certificate-unchanged' "$STATUS_FILE"
+}
+
+@test "deploy-cert restores old certificate when runtime verification fails" {
+  write_base_config
+  make_certificate 30 example.com "$TEST_ROOT/old.key" "$TEST_ROOT/old.pem"
+  make_certificate 60 example.com "$TEST_ROOT/new.key" "$TEST_ROOT/new.pem"
+  seed_certificate_version old "$TEST_ROOT/old.pem" "$TEST_ROOT/old.key"
+  candidate_config_test() { return 0; }
+  restart_and_verify_xray() { return 1; }
+  systemctl() { return 0; }
+
+  run deploy_certificate_locked "$TEST_ROOT/new.pem" "$TEST_ROOT/new.key"
+
+  [ "$status" -ne 0 ]
+  [ "$(readlink "$XRAY_TLS_CURRENT")" = "$XRAY_TLS_VERSIONS/old" ]
+  grep -Fq 'LAST_STAGE=certificate-rollback' "$STATUS_FILE"
+}
+
+@test "upgrade rejects a non-matching requested hash before download or switch" {
+  write_base_config
+  mkdir -p "$XRAY_VERSIONS_DIR/old"
+  atomic_symlink "$XRAY_VERSIONS_DIR/old" "$XRAY_CURRENT"
+  uname() { printf 'x86_64\n'; }
+  download_xray_archive() { return 99; }
+
+  run install_xray_release "$XRAY_VERSION" deadbeef 1
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'does not match the pinned release manifest'* ]]
+  [ "$(readlink "$XRAY_CURRENT")" = "$XRAY_VERSIONS_DIR/old" ]
+}
+
+@test "interrupted or corrupt upgrade never changes current" {
+  write_base_config
+  mkdir -p "$XRAY_VERSIONS_DIR/old"
+  atomic_symlink "$XRAY_VERSIONS_DIR/old" "$XRAY_CURRENT"
+  uname() { printf 'x86_64\n'; }
+  download_xray_archive() { printf 'corrupt' >"$3"; }
+
+  run install_xray_release "$XRAY_VERSION" "$XRAY_AMD64_SHA256" 1
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'checksum mismatch'* ]]
+  [ "$(readlink "$XRAY_CURRENT")" = "$XRAY_VERSIONS_DIR/old" ]
+}
+
+@test "rollback restores captured core config and certificate targets" {
+  write_base_config
+  mkdir -p "$XRAY_VERSIONS_DIR/old-core" "$XRAY_VERSIONS_DIR/new-core" "$XRAY_TLS_VERSIONS/old-cert" "$XRAY_TLS_VERSIONS/new-cert"
+  atomic_symlink "$XRAY_VERSIONS_DIR/old-core" "$XRAY_CURRENT"
+  atomic_symlink "$XRAY_TLS_VERSIONS/old-cert" "$XRAY_TLS_CURRENT"
+  cp "$XRAY_CONFIG" "$TEST_ROOT/original-config"
+  prepare_rollback
+  atomic_symlink "$XRAY_VERSIONS_DIR/new-core" "$XRAY_CURRENT"
+  atomic_symlink "$XRAY_TLS_VERSIONS/new-cert" "$XRAY_TLS_CURRENT"
+  printf '{}\n' >"$XRAY_CONFIG"
+
+  restore_rollback_state
+
+  [ "$(readlink "$XRAY_CURRENT")" = "$XRAY_VERSIONS_DIR/old-core" ]
+  [ "$(readlink "$XRAY_TLS_CURRENT")" = "$XRAY_TLS_VERSIONS/old-cert" ]
+  cmp "$TEST_ROOT/original-config" "$XRAY_CONFIG"
+}
+
+@test "renew calls acme cron without force and avoids a duplicate restart" {
+  write_base_config
+  make_certificate 60 example.com "$TEST_ROOT/current.key" "$TEST_ROOT/current.pem"
+  seed_certificate_version current "$TEST_ROOT/current.pem" "$TEST_ROOT/current.key"
+  ACME_CERT_FILE="$XRAY_TLS_CURRENT/fullchain.pem"
+  ACME_KEY_FILE="$XRAY_TLS_CURRENT/private.key"
+  cat >"$ACME_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >"$TEST_ROOT/acme-args"
+EOF
+  chmod +x "$ACME_BIN"
+  verify_live_certificate() { return 0; }
+  deploy_certificate_locked() { printf 'unexpected-deploy\n' >"$TEST_ROOT/deploy"; return 1; }
+
+  run_renew_locked
+
+  grep -Fxq -- '--cron' "$TEST_ROOT/acme-args"
+  ! grep -Fxq -- '--force' "$TEST_ROOT/acme-args"
+  [ ! -e "$TEST_ROOT/deploy" ]
+  grep -Fq 'LAST_STAGE=not-due' "$STATUS_FILE"
+}
+
+@test "DNS-01 issuance passes a file-sourced token only through the acme environment" {
   CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=192.0.2.10
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=dns
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  printf 'smtp-secret' >"$CERTMAN_SMTP_PASSWORD_FILE"
-  chmod 0600 "$CERTMAN_SMTP_PASSWORD_FILE"
+  make_certificate 60 example.com "$TEST_ROOT/issued.key" "$TEST_ROOT/issued.pem"
+  printf '%s' 'fixture-cloudflare-token' >"$CERTMAN_CF_TOKEN_FILE"
+  chmod 0600 "$CERTMAN_CF_TOKEN_FILE"
+  cat >"$ACME_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >"$TEST_ROOT/acme-issue-args"
+[[ -n \${CF_Token:-} ]] || exit 9
+printf present >"$TEST_ROOT/acme-token-present"
+mkdir -p "$CERTMAN_ACME_HOME/example.com_ecc"
+cp "$TEST_ROOT/issued.pem" "$CERTMAN_ACME_HOME/example.com_ecc/fullchain.cer"
+cp "$TEST_ROOT/issued.key" "$CERTMAN_ACME_HOME/example.com_ecc/example.com.key"
+EOF
+  chmod +x "$ACME_BIN"
 
-  write_config
-  write_msmtp_config
+  issue_certificate_dns
 
-  run grep -R 'smtp-secret' "$CERTMAN_CONFIG_DIR"
-  [ "$status" -eq 0 ]
-  [ "$output" = "$CERTMAN_SMTP_PASSWORD_FILE:smtp-secret" ]
-  ! grep -q 'smtp-secret' "$CERTMAN_CONFIG_FILE"
-  ! grep -q 'smtp-secret' "$CERTMAN_MSMTP_CONFIG"
-  grep -Fq 'tls_starttls off' "$CERTMAN_MSMTP_CONFIG"
-  grep -Fq 'from operator@example.com' "$CERTMAN_MSMTP_CONFIG"
-  grep -Fq "passwordeval \"cat $CERTMAN_SMTP_PASSWORD_FILE\"" "$CERTMAN_MSMTP_CONFIG"
-  mode=$(stat -c %a "$CERTMAN_SMTP_PASSWORD_FILE" 2>/dev/null || stat -f %Lp "$CERTMAN_SMTP_PASSWORD_FILE")
-  [ "$mode" = 600 ]
+  grep -Fxq -- '--issue' "$TEST_ROOT/acme-issue-args"
+  grep -Fxq -- 'dns_cf' "$TEST_ROOT/acme-issue-args"
+  ! grep -Fxq -- '--force' "$TEST_ROOT/acme-issue-args"
+  [ "$(<"$TEST_ROOT/acme-token-present")" = present ]
+  ! grep -R -Fq fixture-cloudflare-token "$TEST_ROOT/acme-issue-args" "$STATUS_FILE" 2>/dev/null
 }
 
-@test "systemd timer is persistent and failure-wired" {
-  systemctl() { :; }
-  INSTALLED_BIN=/usr/local/sbin/trojan-certman
-  install_systemd_units
-  grep -Fq 'Persistent=true' "$CERTMAN_SYSTEMD_DIR/trojan-certman-renew.timer"
-  grep -Fq 'RandomizedDelaySec=1h' "$CERTMAN_SYSTEMD_DIR/trojan-certman-renew.timer"
-  grep -Fq 'OnFailure=trojan-certman-alert@%n.service' "$CERTMAN_SYSTEMD_DIR/trojan-certman-renew.service"
-  grep -Fq 'ExecStart=/usr/local/sbin/trojan-certman renew' "$CERTMAN_SYSTEMD_DIR/trojan-certman-renew.service"
-}
-
-@test "Cloudflare cutover refuses multiple same-name A records" {
+@test "legacy acme deploy paths and reload command are cleared without a second restart" {
   CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=192.0.2.10
-  cf_request() {
-    printf '{"success":true,"result":[{"id":"one"},{"id":"two"}]}\n'
-  }
-  run cutover_dns
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"refusing to modify multiple A records"* ]]
+  cat >"$ACME_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%q\n' "\$@" >"$TEST_ROOT/acme-install-cert-args"
+EOF
+  chmod +x "$ACME_BIN"
+
+  clear_acme_legacy_deploy_state
+
+  grep -Fxq -- '--install-cert' "$TEST_ROOT/acme-install-cert-args"
+  grep -Fxq -- '--reloadcmd' "$TEST_ROOT/acme-install-cert-args"
+  [ "$(tail -n 1 "$TEST_ROOT/acme-install-cert-args")" = "''" ]
 }
 
-@test "Cloudflare cutover creates a missing DNS-only A record and saves rollback" {
-  CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  cf_request() {
-    printf '%s %s %s\n' "$1" "$2" "${3:-}" >>"$TEST_ROOT/cf.log"
-    if [[ "$1" == GET ]]; then
-      printf '{"success":true,"result":[]}\n'
-    else
-      printf '{"success":true,"result":{"id":"created-id"}}\n'
+@test "snapshot is one non-secret line with required signals" {
+  write_base_config
+  systemctl() {
+    if [[ $1 == is-active ]]; then
+      printf 'active\n'
+    elif [[ $* == *NRestarts* ]]; then
+      printf '2\n'
+    elif [[ $* == *MainPID* ]]; then
+      printf '0\n'
     fi
   }
-  verify_authoritative_dns() { return 0; }
+  netstat_counter() { printf '3\n'; }
+  tls_probe() { printf '12|Dec 1 00:00:00 2026 GMT|AA:BB\n'; }
+  sysctl() { printf '4096\n'; }
 
-  cutover_dns
-  grep -Fq 'POST /zones/zone-id/dns_records' "$TEST_ROOT/cf.log"
-  grep -Fq '"proxied":false' "$TEST_ROOT/cf.log"
-  [ "$(jq -r '.action' "$CERTMAN_DNS_BACKUP_FILE")" = create ]
-  [ "$(jq -r '.created_record_id' "$CERTMAN_DNS_BACKUP_FILE")" = created-id ]
-}
+  run snapshot
 
-@test "idempotent Cloudflare cutover preserves the original rollback point" {
-  CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  printf '{"action":"update","sentinel":"keep-me"}\n' >"$CERTMAN_DNS_BACKUP_FILE"
-  cf_request() {
-    printf '{"success":true,"result":[{"id":"same","content":"23.95.133.118","proxied":false}]}\n'
-  }
-  verify_authoritative_dns() { return 0; }
-
-  cutover_dns
-  [ "$(jq -r '.sentinel' "$CERTMAN_DNS_BACKUP_FILE")" = keep-me ]
-}
-
-@test "Cloudflare API failure and authoritative timeout both fail closed" {
-  CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  cf_request() {
-    [[ "$1" == GET ]] && printf '{"success":true,"result":[{"id":"old","content":"23.1.1.1","proxied":false}]}\n' && return 0
-    return 1
-  }
-  run cutover_dns
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"update failed"* ]]
-
-  cf_request() {
-    if [[ "$1" == GET ]]; then
-      printf '{"success":true,"result":[]}\n'
-    else
-      printf '{"success":true,"result":{"id":"new"}}\n'
-    fi
-  }
-  verify_authoritative_dns() { return 1; }
-  run cutover_dns
-  [ "$status" -ne 0 ]
-  [[ "$output" == *"did not converge"* ]]
-}
-
-@test "DNS rollback restores an updated record and verifies authoritative DNS" {
-  CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=dns
-  write_config
-  printf token >"$CERTMAN_CF_TOKEN_FILE"
-  printf '%s\n' '{"action":"update","zone_id":"zone-id","record":{"id":"old-id","type":"A","name":"example.com","content":"23.1.1.1","ttl":1,"proxied":false}}' >"$CERTMAN_DNS_BACKUP_FILE"
-  cf_request() { printf '%s %s %s\n' "$1" "$2" "${3:-}" >>"$TEST_ROOT/rollback.log"; printf '{"success":true,"result":{}}\n'; }
-  verify_authoritative_dns_value() { printf '%s\n' "$1" >"$TEST_ROOT/verified-value"; }
-
-  rollback_dns
-  grep -Fq 'PUT /zones/zone-id/dns_records/old-id' "$TEST_ROOT/rollback.log"
-  [ "$(<"$TEST_ROOT/verified-value")" = 23.1.1.1 ]
-}
-
-@test "certificate validation checks SAN lifetime and key match" {
-  CERT_DOMAIN=example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  make_certificate 30 example.com "$KEY_FILE" "$CERT_FILE"
-  verify_certificate_files
-
-  make_certificate 1 example.com "$KEY_FILE" "$CERT_FILE"
-  run verify_certificate_files
-  [ "$status" -ne 0 ]
-
-  make_certificate 30 wrong.example "$KEY_FILE" "$CERT_FILE"
-  run verify_certificate_files
-  [ "$status" -ne 0 ]
-
-  make_certificate 30 example.com "$KEY_FILE" "$CERT_FILE"
-  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$KEY_FILE" >/dev/null 2>&1
-  run verify_certificate_files
-  [ "$status" -ne 0 ]
-}
-
-@test "live certificate fingerprint must match the managed disk certificate" {
-  CERT_DOMAIN=example.com
-  TROJAN_PORT=443
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  make_certificate 30 example.com "$KEY_FILE" "$CERT_FILE"
-  cp "$CERT_FILE" "$TEST_ROOT/live.pem"
-  timeout() { cat "$TEST_ROOT/live.pem"; }
-  verify_live_certificate
-
-  make_certificate 30 other.example "$TEST_ROOT/other.key" "$TEST_ROOT/live.pem"
-  run verify_live_certificate
-  [ "$status" -ne 0 ]
-}
-
-@test "standalone renewal outside its window does not stop trojan-web" {
-  CERT_DOMAIN=example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=standalone
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=
-  PUBLIC_IPV4=
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  make_certificate 60 example.com "$KEY_FILE" "$CERT_FILE"
-  write_config
-  write_status failed health-verification
-  flock() { return 0; }
-  systemctl() { printf '%s ' "$@" >>"$TEST_ROOT/systemctl.log"; printf '\n' >>"$TEST_ROOT/systemctl.log"; return 0; }
-  verify_live_certificate() { return 0; }
-  send_email() { printf '%s\n' "$1" >"$TEST_ROOT/recovery-email"; }
-
-  run run_renew
   [ "$status" -eq 0 ]
-  ! grep -q 'stop trojan-web.service' "$TEST_ROOT/systemctl.log"
-  grep -Fq 'LAST_STAGE=not-due' "$CERTMAN_STATUS_FILE"
-  grep -Fq 'recovered: example.com' "$TEST_ROOT/recovery-email"
+  [ "$(printf '%s\n' "$output" | wc -l | tr -d ' ')" -eq 1 ]
+  [[ "$output" == *'service=active'* ]]
+  [[ "$output" == *'listen_queue='* ]]
+  [[ "$output" == *'conntrack='* ]]
+  [[ "$output" == *'tls_ms=12'* ]]
+  [[ "$output" != *'fixture-personal-credential'* ]]
 }
 
-@test "standalone renewal failure restores trojan-web" {
-  CERT_DOMAIN=example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=standalone
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=
-  PUBLIC_IPV4=
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  make_certificate 1 example.com "$KEY_FILE" "$CERT_FILE"
-  write_config
-  cat >"$CERTMAN_ACME_BIN" <<'EOF'
-#!/usr/bin/env bash
-exit 1
-EOF
-  chmod +x "$CERTMAN_ACME_BIN"
-  flock() { return 0; }
-  systemctl() { printf '%s ' "$@" >>"$TEST_ROOT/systemctl.log"; printf '\n' >>"$TEST_ROOT/systemctl.log"; return 0; }
+@test "adopt refuses implicit legacy password extraction" {
+  printf '%s\n' '{"password":["must-not-be-read"],"ssl":{"sni":"example.com","cert":"/missing","key":"/missing"}}' >"$CERTMAN_LEGACY_CONFIG"
+  unset CERTMAN_PASSWORD_INPUT_FILE
 
-  run run_renew
+  run adopt_existing
+
   [ "$status" -ne 0 ]
-  grep -q 'stop trojan-web.service' "$TEST_ROOT/systemctl.log"
-  grep -q 'start trojan-web.service' "$TEST_ROOT/systemctl.log"
-  grep -Fq 'LAST_STATE=failed' "$CERTMAN_STATUS_FILE"
+  [[ "$output" == *'requires CERTMAN_PASSWORD_INPUT_FILE'* ]]
+  [ ! -e "$PASSWORD_FILE" ]
 }
 
-@test "successful DNS renewal never forces issuance and restarts Trojan on certificate change" {
+@test "adopt prepares only the loopback canary and preserves production certman timers" {
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password"
+  make_certificate 30 example.com "$TEST_ROOT/legacy.key" "$TEST_ROOT/legacy.pem"
+  jq -n --arg cert "$TEST_ROOT/legacy.pem" --arg key "$TEST_ROOT/legacy.key" \
+    '{ssl:{sni:"example.com",cert:$cert,key:$key}}' >"$CERTMAN_LEGACY_CONFIG"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password"
+  preflight_os() { :; }
+  install_dependencies() { :; }
+  create_xray_user() { :; }
+  install_xray_release() { :; }
+  install_self() { printf '%s\n' "$1" >"$TEST_ROOT/installed-self"; }
+  install_xray_unit() { printf xray >"$TEST_ROOT/installed-unit"; }
+  deploy_certificate() { printf deployed >"$TEST_ROOT/deployed"; }
+  systemctl() { printf '%s\n' "$*" >>"$TEST_ROOT/systemctl.log"; }
+
+  adopt_existing
+
+  [ "$(<"$TEST_ROOT/installed-self")" = "$CERTMAN_STAGED_BIN" ]
+  [ -e "$TEST_ROOT/installed-unit" ]
+  ! grep -q 'trojan-certman-renew' "$TEST_ROOT/systemctl.log"
+  [ "$(jq -r '.inbounds[0].listen' "$XRAY_CONFIG")" = 127.0.0.1 ]
+  [ "$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")" -eq 18443 ]
+}
+
+@test "cutover promotes the verified canary to 443 only after stopping legacy listeners" {
   CERT_DOMAIN=example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=dns
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  make_certificate 30 example.com "$KEY_FILE" "$CERT_FILE"
+  TROJAN_PORT=18443
+  printf '%s' fixture-personal-credential >"$PASSWORD_FILE"
+  chmod 0600 "$PASSWORD_FILE"
   write_config
-  printf token >"$CERTMAN_CF_TOKEN_FILE"
-  cat >"$CERTMAN_ACME_BIN" <<EOF
-#!/usr/bin/env bash
-printf '%s ' "\$@" >"$TEST_ROOT/acme.args"
+  write_xray_config
+  verify_live_certificate() { :; }
+  prepare_legacy_migration() { :; }
+  install_pinned_acme() { :; }
+  clear_acme_legacy_deploy_state() { :; }
+  xray_config_test() { :; }
+  install_self() { printf self >>"$TEST_ROOT/cutover-actions"; }
+  install_systemd_units() { printf units >>"$TEST_ROOT/cutover-actions"; }
+  configure_capacity() { printf capacity >>"$TEST_ROOT/cutover-actions"; }
+  set_cutover_marker() { printf 'marker=%s\n' "$1" >>"$TEST_ROOT/cutover-actions"; }
+  systemctl() { printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"; printf '\n' >>"$TEST_ROOT/systemctl.log"; return 0; }
+
+  cutover_locked
+
+  [ "$(jq -r '.inbounds[0].port' "$XRAY_CONFIG")" -eq 443 ]
+  [ "$(jq -r '.inbounds[0].listen' "$XRAY_CONFIG")" = 0.0.0.0 ]
+  grep -Fxq 'stop|trojan.service|trojan-web.service|' "$TEST_ROOT/systemctl.log"
+  grep -Fq 'marker=1' "$TEST_ROOT/cutover-actions"
+  grep -Fq 'LAST_STAGE=cutover-complete' "$STATUS_FILE"
+}
+
+@test "cutover failure invokes legacy rollback instead of leaving 443 down" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=18443
+  printf '%s' fixture-personal-credential >"$PASSWORD_FILE"
+  chmod 0600 "$PASSWORD_FILE"
+  write_config
+  write_xray_config
+  verify_live_certificate() { :; }
+  prepare_legacy_migration() { :; }
+  install_pinned_acme() { :; }
+  clear_acme_legacy_deploy_state() { :; }
+  xray_config_test() { return 1; }
+  rollback_legacy_locked() { printf rolled-back >"$TEST_ROOT/legacy-rollback"; }
+  systemctl() { return 0; }
+
+  run cutover_locked
+
+  [ "$status" -ne 0 ]
+  [ "$(<"$TEST_ROOT/legacy-rollback")" = rolled-back ]
+}
+
+@test "acme installation failure invokes legacy rollback before touching 443" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=18443
+  printf '%s' fixture-personal-credential >"$PASSWORD_FILE"
+  chmod 0600 "$PASSWORD_FILE"
+  write_config
+  write_xray_config
+  verify_live_certificate() { :; }
+  prepare_legacy_migration() { :; }
+  install_pinned_acme() { return 7; }
+  clear_acme_legacy_deploy_state() { printf cleared >"$TEST_ROOT/acme-cleared"; }
+  rollback_legacy_locked() { printf rolled-back >"$TEST_ROOT/legacy-rollback"; }
+  perform_cutover() { printf touched-443 >"$TEST_ROOT/touched-443"; }
+  systemctl() { return 0; }
+
+  run cutover_locked
+
+  [ "$status" -ne 0 ]
+  [ "$(<"$TEST_ROOT/legacy-rollback")" = rolled-back ]
+  [ ! -e "$TEST_ROOT/touched-443" ]
+}
+
+@test "incomplete legacy rollback keeps the active marker for a safe retry" {
+  mkdir -p "$CERTMAN_LEGACY_MIGRATION_DIR/files/systemd"
+  printf '%s\n' '{"canary":true}' >"$CERTMAN_LEGACY_MIGRATION_DIR/xray-canary.json"
+  printf '%s\n' 'CERT_DOMAIN=example.com' 'TROJAN_PORT=18443' \
+    'ACME_CERT_FILE=/missing/cert' 'ACME_KEY_FILE=/missing/key' \
+    >"$CERTMAN_LEGACY_MIGRATION_DIR/certman-canary.config"
+  cat >"$CERTMAN_LEGACY_MIGRATION_DIR/manifest" <<'EOF'
+CUTOVER_ACTIVE=1
+TROJAN_ACTIVE=1
+TROJAN_ENABLED=1
+WEB_ACTIVE=0
+WEB_ENABLED=0
+RENEW_ACTIVE=0
+RENEW_ENABLED=0
+SOMAXCONN=128
+SYN_BACKLOG=128
+HAD_SYSCTL_FILE=0
+HAD_ACME_HOME=0
+LEGACY_CONFIG_MODE=600
 EOF
-  chmod +x "$CERTMAN_ACME_BIN"
-  flock() { return 0; }
-  certificate_fingerprint() {
-    if [[ -e "$TEST_ROOT/fingerprint-called" ]]; then printf 'after\n'; else touch "$TEST_ROOT/fingerprint-called"; printf 'before\n'; fi
-  }
-  verify_certificate_files() { return 0; }
-  verify_services() { return 0; }
+  restore_legacy_units() { :; }
+  sysctl() { return 0; }
   verify_live_certificate() { return 0; }
-  systemctl() { printf '%s ' "$@" >>"$TEST_ROOT/systemctl.log"; printf '\n' >>"$TEST_ROOT/systemctl.log"; }
-
-  run_renew
-  grep -Fq -- '--cron' "$TEST_ROOT/acme.args"
-  ! grep -Fq -- '--force' "$TEST_ROOT/acme.args"
-  grep -Fq 'restart trojan.service' "$TEST_ROOT/systemctl.log"
-  grep -Fq 'LAST_STATE=success' "$CERTMAN_STATUS_FILE"
-}
-
-@test "failure alert is throttled to one email per 24 hours" {
-  CERT_DOMAIN=example.com
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_PORT=443
-  ACME_MODE=dns
-  CF_ZONE_NAME=example.com
-  CF_ZONE_ID=zone-id
-  PUBLIC_IPV4=23.95.133.118
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  make_certificate 30 example.com "$KEY_FILE" "$CERT_FILE"
-  write_config
-  write_status failed renewal
-  send_email() { printf 'sent\n' >>"$TEST_ROOT/email.log"; }
-
-  send_failure_alert trojan-certman-renew.service
-  send_failure_alert trojan-certman-renew.service
-  [ "$(grep -c '^sent$' "$TEST_ROOT/email.log")" -eq 1 ]
-}
-
-@test "adopt is repeatable and does not install Trojan issue a certificate or touch DNS" {
-  SMTP_HOST=smtp.qiye.aliyun.com
-  SMTP_PORT=465
-  SMTP_USER=operator@example.com
-  SMTP_FROM=operator@example.com
-  SMTP_RECIPIENT=operator@example.com
-  mkdir -p "$(dirname "$CERTMAN_TROJAN_CONFIG")"
-  printf '%s\n' '{"local_port":443,"ssl":{"sni":"example.com","cert":"/managed/fullchain.pem","key":"/managed/private.key"}}' >"$CERTMAN_TROJAN_CONFIG"
-  mkdir -p "$CERTMAN_ACME_HOME/example.com_ecc"
-  printf "Le_Webroot='no'\n" >"$CERTMAN_ACME_HOME/example.com_ecc/example.com.conf"
-  printf smtp-secret >"$TEST_ROOT/smtp-input"
-  export CERTMAN_SMTP_PASSWORD_INPUT_FILE="$TEST_ROOT/smtp-input"
-  msmtp() { :; }
-  systemctl() { :; }
-  verify_health() { :; }
-  deliver_test_email() { printf 'email\n' >>"$TEST_ROOT/adopt.log"; }
-  install_self() { printf 'self\n' >>"$TEST_ROOT/adopt.log"; }
-  install_systemd_units() { printf 'units\n' >>"$TEST_ROOT/adopt.log"; }
-  download_manager() { return 89; }
-  issue_dns_certificate() { return 90; }
-  cutover_dns() { return 91; }
-
-  adopt_existing
-  adopt_existing
-  [ "$(grep -c '^self$' "$TEST_ROOT/adopt.log")" -eq 2 ]
-  [ "$(grep -c '^units$' "$TEST_ROOT/adopt.log")" -eq 2 ]
-  [ "$(grep -c '^email$' "$TEST_ROOT/adopt.log")" -eq 2 ]
-  grep -Fq 'ACME_MODE=standalone' "$CERTMAN_CONFIG_FILE"
-}
-
-@test "guided install keeps DNS cutover last and is safely repeatable under mocks" {
-  CERT_DOMAIN=example.com
-  CF_ZONE_NAME=example.com
-  PUBLIC_IPV4=23.95.133.118
-  CERT_FILE="$CERTMAN_TROJAN_TLS_DIR/fullchain.pem"
-  KEY_FILE="$CERTMAN_TROJAN_TLS_DIR/private.key"
-  TROJAN_MANAGER_BIN="$TEST_ROOT/trojan-manager"
-  cat >"$TROJAN_MANAGER_BIN" <<EOF
-#!/usr/bin/env bash
-printf 'manager\n' >>"$TEST_ROOT/install.log"
-EOF
-  chmod +x "$TROJAN_MANAGER_BIN"
-  step() { printf '%s\n' "$1" >>"$TEST_ROOT/install.log"; }
-  preflight_os() { printf 'amd64\n'; }
-  install_dependencies() { step dependencies; }
-  install_secret() { step secret; }
-  resolve_zone_id() { CF_ZONE_ID=zone-id; step zone; }
-  configure_smtp() {
-    SMTP_HOST=smtp.qiye.aliyun.com
-    SMTP_PORT=465
-    SMTP_USER=operator@example.com
-    SMTP_FROM=operator@example.com
-    SMTP_RECIPIENT=operator@example.com
-    step smtp
+  systemctl() {
+    if [[ $1 == start && $2 == trojan.service ]]; then return 1; fi
+    return 0
   }
-  download_manager() { step "download-$1"; }
-  install_trojan_web_unit() { step web-unit; }
-  issue_dns_certificate() { step issue; }
-  atomic_update_trojan_config() { step config; }
-  systemctl() { step services; }
-  install_self() { step self; }
-  install_systemd_units() { step timer; }
-  verify_health() { step verify; }
-  run_test_email() { step email; }
-  cutover_dns() { step cutover; }
 
-  install_new
-  install_new
-  [ "$(grep -c '^cutover$' "$TEST_ROOT/install.log")" -eq 2 ]
-  [ "$(grep -c '^manager$' "$TEST_ROOT/install.log")" -eq 2 ]
-  first_verify=$(grep -n '^verify$' "$TEST_ROOT/install.log" | head -n1 | cut -d: -f1)
-  first_email=$(grep -n '^email$' "$TEST_ROOT/install.log" | head -n1 | cut -d: -f1)
-  first_cutover=$(grep -n '^cutover$' "$TEST_ROOT/install.log" | head -n1 | cut -d: -f1)
-  ((first_verify < first_email && first_email < first_cutover))
+  run rollback_legacy_locked
+
+  [ "$status" -ne 0 ]
+  grep -Fxq 'CUTOVER_ACTIVE=1' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
 }
 
-@test "automation uninstall targets no Trojan, MariaDB, or certificate path" {
-  body=$(declare -f uninstall_automation)
-  [[ "$body" != *'/usr/local/etc/trojan'* ]]
-  [[ "$body" != *'/home/mariadb'* ]]
-  [[ "$body" != *'/etc/trojan/tls'* ]]
-  [[ "$body" != *'docker rm'* ]]
+@test "systemd assets enforce non-root Xray hardening and scheduled snapshots" {
+  grep -Fxq 'User=xray' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'Group=xray' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'LimitNOFILE=65536' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'NoNewPrivileges=true' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'ProtectSystem=strict' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE' "$CERTMAN_ASSET_DIR/xray.service"
+  grep -Fxq 'OnUnitActiveSec=1min' "$CERTMAN_ASSET_DIR/trojan-certman-snapshot.timer"
+  grep -Fxq 'Persistent=true' "$CERTMAN_ASSET_DIR/trojan-certman-renew.timer"
+  grep -Fxq 'TimeoutStartSec=15min' "$CERTMAN_ASSET_DIR/trojan-certman-renew.service"
+}
+
+@test "v3 script contains no MySQL mutable latest or curl pipe installer" {
+  ! grep -Eq 'MariaDB|mysql|download/latest|curl[^\n]*\|[^\n]*bash' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
