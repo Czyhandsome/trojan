@@ -328,6 +328,27 @@ seed_certificate_version() {
   [ ! -e "$TEST_ROOT/dependencies-called" ]
 }
 
+@test "install rejects foreign content under a managed root without deleting it" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  mkdir -p "$CERTMAN_XRAY_INSTALL_ROOT/foreign-version"
+  printf '%s' foreign-state >"$CERTMAN_XRAY_INSTALL_ROOT/foreign-version/keep"
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'partial or conflicting managed state'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+  [ "$(<"$CERTMAN_XRAY_INSTALL_ROOT/foreign-version/keep")" = foreign-state ]
+}
+
 @test "fresh-install health probing never sources an untrusted residual config" {
   printf '%s\n' \
     'CERT_DOMAIN=$(touch "'"$TEST_ROOT"'/config-executed")' \
@@ -468,7 +489,10 @@ seed_certificate_version() {
     done
     return 1
   }
-  systemctl() { return 0; }
+  systemctl() {
+    [[ $1 == is-active ]] && return 1
+    return 0
+  }
 
   run install_new
 
@@ -570,6 +594,24 @@ seed_certificate_version() {
   [ -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
   [ -e "$CERTMAN_SYSTEMD_DIR/xray.service" ]
   [ ! -e "$TEST_ROOT/systemctl-called" ]
+}
+
+@test "cleanup preserves managed state when Xray cannot be stopped" {
+  printf 'OWNER=trojan-certman-v3\nSTATE=in-progress\n' >"$CERTMAN_INSTALL_TRANSACTION_FILE"
+  install -m 0644 "$CERTMAN_ASSET_DIR/xray.service" "$CERTMAN_SYSTEMD_DIR/xray.service"
+  printf managed-config >"$CERTMAN_XRAY_CONFIG"
+  systemctl() {
+    if [[ $1 == stop && $2 == xray.service ]]; then return 1; fi
+    if [[ $1 == is-active && $3 == xray.service ]]; then return 0; fi
+    return 0
+  }
+
+  run cleanup_fresh_install_transaction
+
+  [ "$status" -ne 0 ]
+  [ -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+  [ -e "$CERTMAN_SYSTEMD_DIR/xray.service" ]
+  [ "$(<"$CERTMAN_XRAY_CONFIG")" = managed-config ]
 }
 
 @test "candidate Xray config keeps a json suffix for format detection" {
@@ -1062,6 +1104,38 @@ EOF
   grep -Fxq 'CUTOVER_ACTIVE=1' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
 }
 
+@test "legacy rollback never restores the retired Web manager" {
+  mkdir -p "$CERTMAN_LEGACY_MIGRATION_DIR/files/systemd"
+  printf '%s\n' '{"canary":true}' >"$CERTMAN_LEGACY_MIGRATION_DIR/xray-canary.json"
+  printf '%s\n' 'CERT_DOMAIN=example.com' 'TROJAN_PORT=18443' \
+    'ACME_CERT_FILE=/missing/cert' 'ACME_KEY_FILE=/missing/key' \
+    >"$CERTMAN_LEGACY_MIGRATION_DIR/certman-canary.config"
+  cat >"$CERTMAN_LEGACY_MIGRATION_DIR/manifest" <<'EOF'
+CUTOVER_ACTIVE=1
+TROJAN_ACTIVE=0
+TROJAN_ENABLED=0
+WEB_ACTIVE=1
+WEB_ENABLED=1
+RENEW_ACTIVE=0
+RENEW_ENABLED=0
+SOMAXCONN=128
+SYN_BACKLOG=128
+HAD_SYSCTL_FILE=0
+HAD_ACME_HOME=0
+LEGACY_CONFIG_MODE=600
+EOF
+  restore_legacy_units() { :; }
+  sysctl() { return 0; }
+  verify_live_certificate() { return 0; }
+  systemctl() { printf '%s\n' "$*" >>"$TEST_ROOT/systemctl.log"; return 0; }
+
+  rollback_legacy_locked
+
+  grep -Fxq 'disable --now trojan-web.service' "$TEST_ROOT/systemctl.log"
+  ! grep -Eq '^(enable|start) trojan-web\.service($| )' "$TEST_ROOT/systemctl.log"
+  grep -Fxq 'CUTOVER_ACTIVE=0' "$CERTMAN_LEGACY_MIGRATION_DIR/manifest"
+}
+
 @test "systemd assets enforce non-root Xray hardening and scheduled snapshots" {
   grep -Fxq 'User=xray' "$CERTMAN_ASSET_DIR/xray.service"
   grep -Fxq 'Group=xray' "$CERTMAN_ASSET_DIR/xray.service"
@@ -1076,4 +1150,5 @@ EOF
 
 @test "v3 script contains no MySQL mutable latest or curl pipe installer" {
   ! grep -Eq 'MariaDB|mysql|download/latest|curl[^\n]*\|[^\n]*bash' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
+  ! grep -Eq 'systemctl (enable|start) trojan-web\.service' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }

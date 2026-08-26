@@ -818,11 +818,16 @@ managed_install_is_healthy() {
 }
 
 managed_state_exists() {
-  local path unit
+  local path root unit
   for path in "$CONFIG_FILE" "$PASSWORD_FILE" "$CF_TOKEN_FILE" "$STATUS_FILE" \
       "$XRAY_CONFIG" "$XRAY_TLS_CURRENT" "$XRAY_CURRENT" "$XRAY_BIN" \
       "$INSTALLED_BIN" "$STAGED_BIN" "$SYSCTL_FILE"; do
     [[ -e $path || -L $path ]] && return 0
+  done
+  for root in "$CONFIG_DIR" "$STATE_DIR" "$XRAY_CONFIG_DIR" "$XRAY_INSTALL_ROOT" \
+      "$MANAGED_ASSET_DIR" "$ROLLBACK_ROOT"; do
+    [[ -d $root ]] || continue
+    find "$root" -mindepth 1 ! -type d -print -quit 2>/dev/null | grep -q . && return 0
   done
   for unit in "${SYSTEMD_UNITS[@]}"; do
     [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]] && return 0
@@ -868,14 +873,20 @@ cleanup_fresh_install_transaction() {
     had_units=1
     systemctl stop xray.service >/dev/null 2>&1 || rc=1
     systemctl disable xray.service >/dev/null 2>&1 || rc=1
+    systemctl is-active --quiet xray.service >/dev/null 2>&1 && rc=1
   fi
   for unit in trojan-certman-renew.timer trojan-certman-snapshot.timer; do
     if [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]]; then
       had_units=1
       systemctl stop "$unit" >/dev/null 2>&1 || rc=1
       systemctl disable "$unit" >/dev/null 2>&1 || rc=1
+      systemctl is-active --quiet "$unit" >/dev/null 2>&1 && rc=1
     fi
   done
+  if ((rc != 0)); then
+    set -e
+    return "$rc"
+  fi
   restore_capacity_before_fresh_install || rc=1
   rm -f -- "$SYSCTL_FILE" || rc=1
   for unit in "${SYSTEMD_UNITS[@]}"; do rm -f -- "$SYSTEMD_DIR/$unit" || rc=1; done
@@ -1054,8 +1065,6 @@ prepare_legacy_migration() {
     printf 'CUTOVER_ACTIVE=0\n'
     printf 'TROJAN_ACTIVE=%q\n' "$(service_is_active trojan.service)"
     printf 'TROJAN_ENABLED=%q\n' "$(service_is_enabled trojan.service)"
-    printf 'WEB_ACTIVE=%q\n' "$(service_is_active trojan-web.service)"
-    printf 'WEB_ENABLED=%q\n' "$(service_is_enabled trojan-web.service)"
     printf 'RENEW_ACTIVE=%q\n' "$(service_is_active trojan-certman-renew.timer)"
     printf 'RENEW_ENABLED=%q\n' "$(service_is_enabled trojan-certman-renew.timer)"
     printf 'SOMAXCONN=%q\n' "$(sysctl -n net.core.somaxconn)"
@@ -1097,11 +1106,12 @@ restore_legacy_units() {
 
 rollback_legacy_locked() {
   local manifest=$LEGACY_MIGRATION_DIR/manifest failed_acme rc=0
-  local TROJAN_ACTIVE=0 TROJAN_ENABLED=0 WEB_ACTIVE=0 WEB_ENABLED=0
+  local TROJAN_ACTIVE=0 TROJAN_ENABLED=0
   local RENEW_ACTIVE=0 RENEW_ENABLED=0 SOMAXCONN=128 SYN_BACKLOG=128 HAD_SYSCTL_FILE=0 HAD_ACME_HOME=0 LEGACY_CONFIG_MODE=unknown
   [[ -r $manifest ]] || return 1
   # shellcheck disable=SC1090
   source "$manifest"
+  systemctl disable --now trojan-web.service >/dev/null 2>&1 || true
   systemctl disable --now trojan-certman-renew.timer trojan-certman-snapshot.timer >/dev/null 2>&1 || true
   systemctl stop xray.service >/dev/null 2>&1 || true
   cp -a "$LEGACY_MIGRATION_DIR/xray-canary.json" "$XRAY_CONFIG" || rc=1
@@ -1125,9 +1135,7 @@ rollback_legacy_locked() {
     chmod "$LEGACY_CONFIG_MODE" "$LEGACY_CONFIG" 2>/dev/null || true
   fi
   if [[ ${TROJAN_ENABLED:-0} == 1 ]]; then systemctl enable trojan.service >/dev/null 2>&1 || rc=1; fi
-  if [[ ${WEB_ENABLED:-0} == 1 ]]; then systemctl enable trojan-web.service >/dev/null 2>&1 || rc=1; fi
   if [[ ${TROJAN_ACTIVE:-0} == 1 ]]; then systemctl start trojan.service || rc=1; fi
-  if [[ ${WEB_ACTIVE:-0} == 1 ]]; then systemctl start trojan-web.service || rc=1; fi
   if [[ ${RENEW_ENABLED:-0} == 1 ]]; then systemctl enable trojan-certman-renew.timer >/dev/null 2>&1 || rc=1; fi
   if [[ ${RENEW_ACTIVE:-0} == 1 ]]; then systemctl start trojan-certman-renew.timer || rc=1; fi
   systemctl start xray.service >/dev/null 2>&1 || rc=1
@@ -1135,7 +1143,6 @@ rollback_legacy_locked() {
     systemctl is-active --quiet trojan.service || rc=1
     ss -lntH 'sport = :443' 2>/dev/null | grep -q . || rc=1
   fi
-  if [[ ${WEB_ACTIVE:-0} == 1 ]]; then systemctl is-active --quiet trojan-web.service || rc=1; fi
   if [[ ${RENEW_ACTIVE:-0} == 1 ]]; then systemctl is-active --quiet trojan-certman-renew.timer || rc=1; fi
   systemctl is-active --quiet xray.service || rc=1
   verify_live_certificate || rc=1
