@@ -1074,7 +1074,13 @@ EOF
   install_systemd_units() { printf units >>"$TEST_ROOT/cutover-actions"; }
   configure_capacity() { printf capacity >>"$TEST_ROOT/cutover-actions"; }
   set_cutover_marker() { printf 'marker=%s\n' "$1" >>"$TEST_ROOT/cutover-actions"; }
-  systemctl() { printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"; printf '\n' >>"$TEST_ROOT/systemctl.log"; return 0; }
+  systemctl() {
+    printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"
+    printf '\n' >>"$TEST_ROOT/systemctl.log"
+    if [[ $1 == is-active || $1 == is-enabled ]] \
+        && [[ ${3:-} == trojan-web.service ]]; then return 1; fi
+    return 0
+  }
 
   cutover_locked
 
@@ -1188,7 +1194,8 @@ EOF
   systemctl() {
     printf '%s|' "$@" >>"$TEST_ROOT/systemctl.log"
     printf '\n' >>"$TEST_ROOT/systemctl.log"
-    if [[ $1 == is-active || $1 == is-enabled ]]; then return 1; fi
+    if [[ $1 == is-active || $1 == is-enabled ]] \
+        && [[ ${3:-} == trojan-web.service ]]; then return 1; fi
     return 0
   }
 
