@@ -1,7 +1,9 @@
 #!/usr/bin/env bats
 
 setup() {
-  export TEST_ROOT="$BATS_TEST_TMPDIR/root"
+  local bats_tmp_base
+  bats_tmp_base=${BATS_TEST_TMPDIR:-${BATS_TMPDIR:-${TMPDIR:-/tmp}}}
+  export TEST_ROOT="$bats_tmp_base/trojan-certman-${BATS_TEST_NUMBER:-$$}"
   mkdir -p "$TEST_ROOT/etc/trojan-certman/secrets" "$TEST_ROOT/var/lib/trojan-certman" \
     "$TEST_ROOT/etc/xray/tls/versions" "$TEST_ROOT/usr/local/lib/xray/versions" \
     "$TEST_ROOT/usr/local/bin" "$TEST_ROOT/etc/systemd/system" "$TEST_ROOT/run/lock" \

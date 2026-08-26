@@ -202,8 +202,9 @@ verify_certificate_pair() {
   [[ -r $cert && -r $key ]] || return 1
   openssl x509 -in "$cert" -noout -checkend "$MIN_VALID_SECONDS" >/dev/null 2>&1 || return 1
   openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null \
-    | grep -Fq 'X509v3 Subject Alternative Name' || return 1
-  openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1 || return 1
+    | tr ',' '\n' \
+    | sed -E 's/^[[:space:]]+//' \
+    | grep -Fxq "DNS:$domain" || return 1
   cert_pub=$(openssl x509 -in "$cert" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   key_pub=$(openssl pkey -in "$key" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')
   [[ -n $cert_pub && $cert_pub == "$key_pub" ]]
