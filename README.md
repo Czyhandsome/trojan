@@ -35,9 +35,21 @@ Clash 兼容 canary，不能只看配置语法通过。
 匹配后才允许原子切换。当前脚本固定 Xray `v26.3.27` 和 acme.sh `3.1.4`；
 发布新版本时必须在代码审查中同时更新版本、架构哈希和故障注入用例。
 
-## CLI
+## Fresh install
 
-从已校验的版本化 release 解包后，在仓库目录执行新装；不要直接执行网络响应：
+`install` 只用于一台没有 Xray、certman、相关 systemd unit、443 监听和残留托管文件的
+新机器。先人工完成以下前置条件：
+
+- 为节点域名创建 DNS-only A 记录并确认已指向新机公网 IPv4；安装器不创建或修改
+  A/AAAA 记录。
+- 创建仅限目标 zone 的 Cloudflare API token，权限只包含 `Zone:Read`、`DNS:Edit`；
+  可以时再限制来源为新机公网 IP。
+- 将独立 Trojan 密码和 Cloudflare token 分别写入新机上的普通文件；文件必须是
+  `0600 root:root`、不能是符号链接、只能包含一行非空值。不要在终端、聊天或日志中
+  打印文件内容。
+
+DNS 和两个 secret 文件准备好后，从已校验的版本化归档解包，只执行一次安装命令；
+不要直接执行网络响应：
 
 ```bash
 sudo env \
@@ -50,6 +62,17 @@ sudo env \
 `install` 使用固定版本 acme.sh 和 Cloudflare DNS-01 签发证书，只创建临时 TXT 记录；
 不会修改域名的 A/AAAA 记录。Cloudflare token 应限定到目标 zone 的 `Zone:Read` 与
 `DNS:Edit`。生产 A/AAAA 切换仍是独立人工操作。
+
+首次安装在所有只读检查通过后才记录事务。`ERR`、`INT`、`TERM` 或下次启动发现遗留
+事务时，只清理能够证明由本次 fresh install 创建的 Xray/certman 状态，并恢复原 sysctl；
+已经安装的 apt 依赖和空闲 `xray` 系统用户会保留。无法证明归属的 unit、443 监听、
+残留文件或已有 acme.sh 目录会导致拒绝安装，不会被覆盖或删除。已有 acme.sh 只有在
+版本、主脚本、Cloudflare DNS 插件和 certman pin marker 全部匹配时才允许复用。
+
+完整且健康的托管安装再次运行相同命令时只验证状态并成功返回，不续签、不重启、
+不改配置。若重跑时继续提供 secret 输入，它们必须与已安装值一致，否则无修改失败。
+
+## CLI
 
 安装完成后只使用以下入口：
 
@@ -89,8 +112,9 @@ token 会安装为 `/etc/trojan-certman-v3/secrets/cloudflare-token`（`0600 roo
 不会进入命令行参数或日志。续签检查始终显式使用 `dns_cf`，不依赖旧证书保存的
 HTTP-01/webroot 方法；未到续签时间时接受 acme.sh 的 skip 状态，不使用 `--force`。
 
-## Aiyun 迁移与回滚
+## 旧节点 adopt/cutover 与回滚
 
+旧 Trojan 节点不能使用 fresh `install` 原地覆盖，应走 `adopt`、canary、`cutover`。
 生产切换不是安装脚本的隐式步骤。以下步骤都要在现场回读后执行；停止旧服务、占用
 443、取消端口映射等写操作必须获得针对当次目标的明确授权。
 

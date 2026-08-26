@@ -14,6 +14,7 @@ ACME_VERSION="3.1.4"
 ACME_COMMIT="3661fd86b6304115e42f43910e6dd452ab9866d6"
 ACME_TARBALL_SHA256="9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884"
 ACME_SCRIPT_SHA256="fcabf274d4f96966ec933879ae0257266e8ef2f7d16161f14b84dd896c0cac32"
+ACME_DNS_CF_SHA256="9628ee8238cb3f9cfa1b1a985c0e9593436a3e4f8a9d65a6f775b981be9e76c8"
 ACME_TARBALL_URL="https://codeload.github.com/acmesh-official/acme.sh/tar.gz/3661fd86b6304115e42f43910e6dd452ab9866d6"
 
 CONFIG_DIR=${CERTMAN_CONFIG_DIR:-/etc/trojan-certman-v3}
@@ -23,6 +24,7 @@ PASSWORD_FILE=${CERTMAN_PASSWORD_FILE:-${SECRETS_DIR}/trojan-password}
 CF_TOKEN_FILE=${CERTMAN_CF_TOKEN_FILE:-${SECRETS_DIR}/cloudflare-token}
 STATE_DIR=${CERTMAN_STATE_DIR:-/var/lib/trojan-certman-v3}
 STATUS_FILE=${CERTMAN_STATUS_FILE:-${STATE_DIR}/status}
+INSTALL_TRANSACTION_FILE=${CERTMAN_INSTALL_TRANSACTION_FILE:-${STATE_DIR}/install-transaction}
 ROLLBACK_ROOT=${CERTMAN_ROLLBACK_ROOT:-${STATE_DIR}/rollback}
 LEGACY_MIGRATION_DIR=${CERTMAN_LEGACY_MIGRATION_DIR:-${STATE_DIR}/legacy-migration}
 LOCK_FILE=${CERTMAN_LOCK_FILE:-/run/lock/trojan-certman-v3.lock}
@@ -60,6 +62,7 @@ SYSTEMD_UNITS=(
 
 ACME_HOME=${CERTMAN_ACME_HOME:-/root/.acme.sh}
 ACME_BIN=${CERTMAN_ACME_BIN:-${ACME_HOME}/acme.sh}
+ACME_PIN_FILE=${CERTMAN_ACME_PIN_FILE:-${ACME_HOME}/.trojan-certman-pin}
 LEGACY_CONFIG=${CERTMAN_LEGACY_CONFIG:-/usr/local/etc/trojan/config.json}
 MIN_VALID_SECONDS=$((14 * 24 * 60 * 60))
 
@@ -135,13 +138,14 @@ read_link_or_empty() {
 }
 
 install_secret_file() {
-  local target=$1 input=$2 temp
-  [[ -f $input ]] || die 'secret input file not found'
+  local target=$1 input=$2 temp content
+  valid_secret_input "$input" || die 'secret input file is invalid'
+  content=$(<"$input")
+  content=${content%$'\r'}
   install -d -m 0700 "$SECRETS_DIR"
   temp=$(mktemp "${SECRETS_DIR}/.secret.XXXXXX")
   chmod 0600 "$temp"
-  tr -d '\r\n' <"$input" >"$temp"
-  [[ -s $temp ]] || { rm -f -- "$temp"; die 'secret input file is empty'; }
+  printf '%s' "$content" >"$temp"
   mv -f "$temp" "$target"
   chmod 0600 "$target"
   safe_chown root:root "$target" 2>/dev/null || true
@@ -371,6 +375,10 @@ deploy_certificate_locked() {
 }
 
 with_lock() {
+  if [[ ${CERTMAN_SKIP_LOCK:-0} == 1 ]]; then
+    "$@"
+    return
+  fi
   install -d -m 0755 "$(dirname "$LOCK_FILE")"
   exec 9>"$LOCK_FILE"
   flock -n 9 || die 'another certman operation is running'
@@ -475,14 +483,39 @@ rollback_locked() {
   log 'previous core, configuration and certificate restored'
 }
 
+acme_home_is_trusted() {
+  local script_sha plugin_sha
+  [[ -x $ACME_BIN && -r $ACME_HOME/dnsapi/dns_cf.sh && -r $ACME_PIN_FILE ]] || return 1
+  script_sha=$(sha256sum "$ACME_BIN" | awk '{print $1}')
+  plugin_sha=$(sha256sum "$ACME_HOME/dnsapi/dns_cf.sh" | awk '{print $1}')
+  [[ $script_sha == "$ACME_SCRIPT_SHA256" && $plugin_sha == "$ACME_DNS_CF_SHA256" ]] || return 1
+  [[ $("$ACME_BIN" --version 2>/dev/null) == *"$ACME_VERSION"* ]] || return 1
+  grep -Fxq "VERSION=$ACME_VERSION" "$ACME_PIN_FILE" || return 1
+  grep -Fxq "COMMIT=$ACME_COMMIT" "$ACME_PIN_FILE" || return 1
+  grep -Fxq "SCRIPT_SHA256=$ACME_SCRIPT_SHA256" "$ACME_PIN_FILE" || return 1
+  grep -Fxq "DNS_CF_SHA256=$ACME_DNS_CF_SHA256" "$ACME_PIN_FILE" || return 1
+  if [[ ${CERTMAN_SKIP_ROOT_CHECK:-0} != 1 ]]; then
+    [[ $(stat -c %u "$ACME_BIN") == 0 && $(stat -c %u "$ACME_HOME/dnsapi/dns_cf.sh") == 0 \
+        && $(stat -c %u "$ACME_PIN_FILE") == 0 ]] || return 1
+    [[ $(stat -c %a "$ACME_PIN_FILE") == 600 ]] || return 1
+  fi
+}
+
+write_acme_pin_marker() {
+  local temp
+  temp=$(mktemp "${ACME_HOME}/.trojan-certman-pin.XXXXXX")
+  printf 'VERSION=%s\nCOMMIT=%s\nSCRIPT_SHA256=%s\nDNS_CF_SHA256=%s\n' \
+    "$ACME_VERSION" "$ACME_COMMIT" "$ACME_SCRIPT_SHA256" "$ACME_DNS_CF_SHA256" >"$temp"
+  chmod 0600 "$temp"
+  safe_chown root:root "$temp" 2>/dev/null || true
+  mv -f "$temp" "$ACME_PIN_FILE"
+}
+
 install_pinned_acme() {
-  local stage archive actual source installed_sha
-  if [[ -x $ACME_BIN ]]; then
-    installed_sha=$(sha256sum "$ACME_BIN" | awk '{print $1}')
-    if [[ $installed_sha == "$ACME_SCRIPT_SHA256" ]] \
-        && [[ $("$ACME_BIN" --version 2>/dev/null) == *"$ACME_VERSION"* ]]; then
-      return 0
-    fi
+  local stage archive actual source installed_sha installed_plugin_sha
+  if [[ -e $ACME_HOME || -L $ACME_HOME ]]; then
+    acme_home_is_trusted || die 'existing acme.sh home is not owned and pinned by certman'
+    return 0
   fi
   stage=$(mktemp -d)
   archive="$stage/acme.tar.gz"
@@ -496,13 +529,35 @@ install_pinned_acme() {
   rm -rf -- "$stage"
   [[ -x $ACME_BIN ]] || die 'pinned acme.sh installation failed'
   installed_sha=$(sha256sum "$ACME_BIN" | awk '{print $1}')
+  installed_plugin_sha=$(sha256sum "$ACME_HOME/dnsapi/dns_cf.sh" | awk '{print $1}')
   [[ $installed_sha == "$ACME_SCRIPT_SHA256" ]] || die 'installed acme.sh script checksum mismatch'
+  [[ $installed_plugin_sha == "$ACME_DNS_CF_SHA256" ]] || die 'installed Cloudflare DNS plugin checksum mismatch'
+  write_acme_pin_marker
+  acme_home_is_trusted || die 'installed acme.sh home failed ownership and pin verification'
+}
+
+scrub_acme_cloudflare_token() {
+  local conf temp
+  for conf in "$ACME_HOME/account.conf" "${ACME_HOME}/${CERT_DOMAIN}_ecc/${CERT_DOMAIN}.conf"; do
+    [[ -f $conf ]] || continue
+    temp=$(mktemp "${conf}.scrub.XXXXXX")
+    awk '!/^(SAVED_)?CF_Token=/' "$conf" >"$temp"
+    chmod 0600 "$temp"
+    safe_chown root:root "$temp" 2>/dev/null || true
+    mv -f "$temp" "$conf"
+  done
 }
 
 issue_certificate_dns() {
+  local rc
   [[ -s $CF_TOKEN_FILE ]] || die 'Cloudflare token file is missing'
+  set +e
   CF_Token=$(tr -d '\r\n' <"$CF_TOKEN_FILE") "$ACME_BIN" --issue --dns dns_cf \
     -d "$CERT_DOMAIN" --server letsencrypt --keylength ec-256
+  rc=$?
+  set -e
+  scrub_acme_cloudflare_token || return 1
+  ((rc == 0 || rc == 2)) || return "$rc"
   ACME_CERT_FILE="${ACME_HOME}/${CERT_DOMAIN}_ecc/fullchain.cer"
   ACME_KEY_FILE="${ACME_HOME}/${CERT_DOMAIN}_ecc/${CERT_DOMAIN}.key"
   verify_certificate_pair "$ACME_CERT_FILE" "$ACME_KEY_FILE" "$CERT_DOMAIN" \
@@ -525,6 +580,7 @@ run_renew_locked() {
     --dns dns_cf -d "$CERT_DOMAIN" --server letsencrypt --keylength ec-256
   rc=$?
   set -e
+  scrub_acme_cloudflare_token || { write_status failed token-scrub; return 1; }
   ((rc == 0 || rc == 2)) || { write_status failed renewal; return "$rc"; }
   [[ -r $ACME_CERT_FILE && -r $ACME_KEY_FILE ]] || { write_status success not-due; return 0; }
   after=$(certificate_fingerprint_file "$ACME_CERT_FILE" 2>/dev/null || true)
@@ -673,34 +729,268 @@ preflight_os() {
   normalize_arch "$(uname -m)" >/dev/null || die 'supported architectures: amd64, arm64'
 }
 
+normalized_secret_matches() {
+  local input=$1 installed=$2 content
+  valid_secret_input "$input" || return 1
+  [[ -s $installed ]] || return 1
+  content=$(<"$input")
+  content=${content%$'\r'}
+  cmp -s <(printf '%s' "$content") "$installed"
+}
+
+valid_dns_name() {
+  local domain=$1
+  (( ${#domain} <= 253 )) || return 1
+  [[ $domain =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]
+}
+
+valid_secret_input() {
+  local input=$1 content
+  [[ -f $input && ! -L $input && -r $input ]] || return 1
+  content=$(<"$input") || return 1
+  content=${content%$'\r'}
+  [[ -n $content && $content != *$'\n'* && $content != *$'\r'* ]] || return 1
+  cmp -s "$input" <(printf '%s' "$content") \
+    || cmp -s "$input" <(printf '%s\n' "$content") \
+    || cmp -s "$input" <(printf '%s\r\n' "$content") \
+    || return 1
+  if [[ ${CERTMAN_SKIP_ROOT_CHECK:-0} != 1 ]]; then
+    [[ $(stat -c %u "$input") == 0 && $(stat -c %a "$input") == 600 ]] || return 1
+  fi
+}
+
+xray_owns_listener() {
+  local port=$1 pid
+  pid=$(systemctl show xray.service -p MainPID --value 2>/dev/null) || return 1
+  [[ $pid =~ ^[0-9]+$ && $pid -gt 0 ]] || return 1
+  ss -lntpH "sport = :${port}" 2>/dev/null | grep -Fq "pid=${pid},"
+}
+
+pinned_xray_install_is_healthy() {
+  local arch expected target
+  arch=$(normalize_arch "$(uname -m)") || return 1
+  expected=$(xray_sha_for_arch "$arch")
+  target=$(read_link_or_empty "$XRAY_CURRENT")
+  [[ -n $target && $target == "${XRAY_VERSIONS_DIR}/"* ]] || return 1
+  [[ -x $target/xray && -r $target/.archive.sha256 ]] || return 1
+  [[ $(<"$target/.archive.sha256") == "$expected" ]] || return 1
+  [[ -L $XRAY_BIN && $(readlink "$XRAY_BIN") == "$XRAY_CURRENT/xray" ]] || return 1
+  xray_binary_matches_version "$target/xray" "$XRAY_VERSION"
+}
+
+managed_units_are_complete() {
+  local unit
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    [[ -r $SYSTEMD_DIR/$unit && -r $MANAGED_ASSET_DIR/$unit ]] || return 1
+    cmp -s "$SYSTEMD_DIR/$unit" "$MANAGED_ASSET_DIR/$unit" || return 1
+  done
+}
+
+managed_fresh_config_matches() {
+  local requested_domain=$1 requested_port=$2
+  cmp -s "$CONFIG_FILE" <({
+    printf 'CERT_DOMAIN=%q\n' "$requested_domain"
+    printf 'TROJAN_PORT=%q\n' "$requested_port"
+    printf 'ACME_CERT_FILE=%q\n' "${ACME_HOME}/${requested_domain}_ecc/fullchain.cer"
+    printf 'ACME_KEY_FILE=%q\n' "${ACME_HOME}/${requested_domain}_ecc/${requested_domain}.key"
+  })
+}
+
+managed_install_is_healthy() {
+  local requested_domain=$1 requested_port=$2
+  [[ -r $CONFIG_FILE && -s $PASSWORD_FILE && -s $CF_TOKEN_FILE ]] || return 1
+  [[ -r $XRAY_CONFIG && -x $XRAY_BIN && -x $INSTALLED_BIN ]] || return 1
+  [[ -r $(current_cert_file) && -r $(current_key_file) ]] || return 1
+  managed_fresh_config_matches "$requested_domain" "$requested_port" || return 1
+  managed_units_are_complete || return 1
+  pinned_xray_install_is_healthy || return 1
+  verify_certificate_pair "$(current_cert_file)" "$(current_key_file)" "$requested_domain" || return 1
+  acme_home_is_trusted || return 1
+  xray_config_test || return 1
+  verify_live_certificate || return 1
+  systemctl is-active --quiet xray.service || return 1
+  systemctl is-enabled --quiet xray.service || return 1
+  xray_owns_listener "$requested_port" || return 1
+  systemctl is-active --quiet trojan-certman-renew.timer || return 1
+  systemctl is-active --quiet trojan-certman-snapshot.timer || return 1
+  systemctl is-enabled --quiet trojan-certman-renew.timer || return 1
+  systemctl is-enabled --quiet trojan-certman-snapshot.timer || return 1
+}
+
+managed_state_exists() {
+  local path unit
+  for path in "$CONFIG_FILE" "$PASSWORD_FILE" "$CF_TOKEN_FILE" "$STATUS_FILE" \
+      "$XRAY_CONFIG" "$XRAY_TLS_CURRENT" "$XRAY_CURRENT" "$XRAY_BIN" \
+      "$INSTALLED_BIN" "$STAGED_BIN" "$SYSCTL_FILE"; do
+    [[ -e $path || -L $path ]] && return 0
+  done
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]] && return 0
+  done
+  return 1
+}
+
+install_transaction_is_owned() {
+  [[ -r $INSTALL_TRANSACTION_FILE ]] \
+    && grep -Fxq 'OWNER=trojan-certman-v3' "$INSTALL_TRANSACTION_FILE"
+}
+
+managed_units_match_assets() {
+  local unit expected
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]] || continue
+    if [[ -r $MANAGED_ASSET_DIR/$unit ]]; then
+      expected=$MANAGED_ASSET_DIR/$unit
+    else
+      expected=$ASSET_DIR/$unit
+    fi
+    [[ -r $expected ]] && cmp -s "$SYSTEMD_DIR/$unit" "$expected" || return 1
+  done
+}
+
+restore_capacity_before_fresh_install() {
+  local setting
+  [[ -r $STATE_DIR/sysctl-before ]] || return 0
+  while IFS= read -r setting; do
+    case $setting in
+      net.core.somaxconn=*|net.ipv4.tcp_max_syn_backlog=*) sysctl -w "$setting" >/dev/null || return 1 ;;
+      *) return 1 ;;
+    esac
+  done <"$STATE_DIR/sysctl-before"
+}
+
+cleanup_fresh_install_transaction() {
+  local unit rc=0 had_units=0
+  install_transaction_is_owned || return 1
+  managed_units_match_assets || return 1
+  set +e
+  if [[ -e $SYSTEMD_DIR/xray.service || -L $SYSTEMD_DIR/xray.service ]]; then
+    had_units=1
+    systemctl stop xray.service >/dev/null 2>&1 || rc=1
+    systemctl disable xray.service >/dev/null 2>&1 || rc=1
+  fi
+  for unit in trojan-certman-renew.timer trojan-certman-snapshot.timer; do
+    if [[ -e $SYSTEMD_DIR/$unit || -L $SYSTEMD_DIR/$unit ]]; then
+      had_units=1
+      systemctl stop "$unit" >/dev/null 2>&1 || rc=1
+      systemctl disable "$unit" >/dev/null 2>&1 || rc=1
+    fi
+  done
+  restore_capacity_before_fresh_install || rc=1
+  rm -f -- "$SYSCTL_FILE" || rc=1
+  for unit in "${SYSTEMD_UNITS[@]}"; do rm -f -- "$SYSTEMD_DIR/$unit" || rc=1; done
+  if ((had_units == 1)); then systemctl daemon-reload >/dev/null 2>&1 || rc=1; fi
+  rm -f -- "$XRAY_BIN" "$INSTALLED_BIN" "$STAGED_BIN" "$XRAY_CONFIG" \
+    "$PASSWORD_FILE" "$CF_TOKEN_FILE" "$CONFIG_FILE" "$STATUS_FILE" || rc=1
+  rm -rf -- "$XRAY_TLS_ROOT" "$XRAY_INSTALL_ROOT" "$MANAGED_ASSET_DIR" "$ROLLBACK_ROOT" || rc=1
+  if grep -Fxq 'ACME_HOME_INITIAL=absent' "$INSTALL_TRANSACTION_FILE" \
+      && [[ -e $ACME_HOME || -L $ACME_HOME ]] \
+      && ! acme_home_is_trusted; then
+    rm -rf -- "$ACME_HOME" || rc=1
+  fi
+  rmdir "$SECRETS_DIR" "$CONFIG_DIR" "$XRAY_CONFIG_DIR" 2>/dev/null || true
+  rm -f -- "$STATE_DIR/sysctl-before" || rc=1
+  if ((rc == 0)); then
+    rm -f -- "$INSTALL_TRANSACTION_FILE" || rc=1
+    rmdir "$STATE_DIR" 2>/dev/null || true
+  fi
+  set -e
+  return "$rc"
+}
+
+begin_fresh_install_transaction() {
+  local temp acme_initial=absent
+  if [[ -e $ACME_HOME || -L $ACME_HOME ]]; then
+    acme_home_is_trusted || die 'existing acme.sh home changed after preflight'
+    acme_initial=trusted
+  fi
+  install -d -m 0700 "$STATE_DIR"
+  temp=$(mktemp "${STATE_DIR}/.install-transaction.XXXXXX")
+  printf 'OWNER=trojan-certman-v3\nSTATE=in-progress\nACME_HOME_INITIAL=%s\n' "$acme_initial" >"$temp"
+  chmod 0600 "$temp"
+  mv -f "$temp" "$INSTALL_TRANSACTION_FILE"
+  INSTALL_TRANSACTION_ACTIVE=1
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap fresh_install_exit_guard EXIT
+}
+
+fresh_install_exit_guard() {
+  local rc=$?
+  trap - EXIT INT TERM
+  if [[ ${INSTALL_TRANSACTION_ACTIVE:-0} == 1 ]]; then
+    cleanup_fresh_install_transaction || rc=1
+  fi
+  exit "$rc"
+}
+
+commit_fresh_install_transaction() {
+  rm -f -- "$INSTALL_TRANSACTION_FILE"
+  INSTALL_TRANSACTION_ACTIVE=0
+  trap - EXIT INT TERM
+}
+
 install_new() {
-  local arch sha
   require_root
+  with_lock install_new_locked "$@"
+}
+
+install_new_locked() {
+  local arch sha requested_domain requested_port
   preflight_os
-  install_dependencies
-  create_xray_user
-  [[ -n ${CERT_DOMAIN:-} ]] || die 'CERT_DOMAIN is required'
-  TROJAN_PORT=${TROJAN_PORT:-443}
-  [[ $TROJAN_PORT == 443 ]] || die 'personal-node install listens on port 443'
+  requested_domain=${CERT_DOMAIN:-}
+  requested_port=${TROJAN_PORT:-443}
+  [[ -n $requested_domain ]] || die 'CERT_DOMAIN is required'
+  valid_dns_name "$requested_domain" || die 'CERT_DOMAIN must be a valid DNS name'
+  [[ $requested_port == 443 ]] || die 'personal-node install listens on port 443'
+  CERT_DOMAIN=$requested_domain
+  TROJAN_PORT=$requested_port
+  if [[ -e $INSTALL_TRANSACTION_FILE || -L $INSTALL_TRANSACTION_FILE ]]; then
+    cleanup_fresh_install_transaction \
+      || die 'stale fresh-install transaction could not be recovered safely'
+  fi
+  if managed_install_is_healthy "$requested_domain" "$requested_port"; then
+    if [[ -n ${CERTMAN_PASSWORD_INPUT_FILE:-} ]] \
+        && ! normalized_secret_matches "$CERTMAN_PASSWORD_INPUT_FILE" "$PASSWORD_FILE"; then
+      die 'password input does not match the installed managed node'
+    fi
+    if [[ -n ${CERTMAN_CF_TOKEN_INPUT_FILE:-} ]] \
+        && ! normalized_secret_matches "$CERTMAN_CF_TOKEN_INPUT_FILE" "$CF_TOKEN_FILE"; then
+      die 'Cloudflare token input does not match the installed managed node'
+    fi
+    log 'personal Xray Trojan node is already installed and healthy; no changes made'
+    return 0
+  fi
+  managed_state_exists && die 'partial or conflicting managed state exists; refusing fresh install'
   [[ -n ${CERTMAN_PASSWORD_INPUT_FILE:-} && -n ${CERTMAN_CF_TOKEN_INPUT_FILE:-} ]] \
     || die 'password and Cloudflare token input files are required'
+  valid_secret_input "$CERTMAN_PASSWORD_INPUT_FILE" || die 'password input file is missing, unreadable or empty'
+  valid_secret_input "$CERTMAN_CF_TOKEN_INPUT_FILE" || die 'Cloudflare token input file is missing, unreadable or empty'
   if ss -lntH 'sport = :443' 2>/dev/null | grep -q .; then die 'port 443 is already in use'; fi
-  install_secret_file "$PASSWORD_FILE" "$CERTMAN_PASSWORD_INPUT_FILE"
-  install_secret_file "$CF_TOKEN_FILE" "$CERTMAN_CF_TOKEN_INPUT_FILE"
+  if [[ -e $ACME_HOME || -L $ACME_HOME ]]; then
+    acme_home_is_trusted || die 'existing acme.sh home is not owned and pinned by certman'
+  fi
+  install_dependencies || die 'dependency installation failed'
+  create_xray_user || die 'xray user creation failed'
+  begin_fresh_install_transaction
+  install_secret_file "$PASSWORD_FILE" "$CERTMAN_PASSWORD_INPUT_FILE" || die 'password installation failed'
+  install_secret_file "$CF_TOKEN_FILE" "$CERTMAN_CF_TOKEN_INPUT_FILE" || die 'Cloudflare token installation failed'
   arch=$(normalize_arch "$(uname -m)")
   sha=$(xray_sha_for_arch "$arch")
-  install_xray_release "$XRAY_VERSION" "$sha" 1
-  install_pinned_acme
-  issue_certificate_dns
-  clear_acme_legacy_deploy_state
-  write_config
-  write_xray_config
-  install_self
-  install_systemd_units
-  configure_capacity
-  deploy_certificate "$ACME_CERT_FILE" "$ACME_KEY_FILE"
-  systemctl enable xray.service
-  systemctl start trojan-certman-renew.timer trojan-certman-snapshot.timer
+  install_xray_release "$XRAY_VERSION" "$sha" 1 || die 'Xray installation failed'
+  install_pinned_acme || die 'pinned acme.sh installation failed'
+  issue_certificate_dns || die 'DNS-01 certificate issuance failed'
+  clear_acme_legacy_deploy_state || die 'acme.sh deploy-state cleanup failed'
+  write_config || die 'certman configuration write failed'
+  write_xray_config || die 'Xray configuration write failed'
+  install_self || die 'certman CLI installation failed'
+  install_systemd_units || die 'systemd unit installation failed'
+  configure_capacity || die 'capacity configuration failed'
+  deploy_certificate_locked "$ACME_CERT_FILE" "$ACME_KEY_FILE" || die 'certificate deployment failed'
+  systemctl enable xray.service || die 'Xray enablement failed'
+  systemctl start trojan-certman-renew.timer trojan-certman-snapshot.timer \
+    || die 'certman timer start failed'
+  commit_fresh_install_transaction
   log 'personal Xray Trojan node installed'
 }
 

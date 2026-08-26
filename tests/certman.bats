@@ -7,7 +7,7 @@ setup() {
   mkdir -p "$TEST_ROOT/etc/trojan-certman/secrets" "$TEST_ROOT/var/lib/trojan-certman" \
     "$TEST_ROOT/etc/xray/tls/versions" "$TEST_ROOT/usr/local/lib/xray/versions" \
     "$TEST_ROOT/usr/local/bin" "$TEST_ROOT/etc/systemd/system" "$TEST_ROOT/run/lock" \
-    "$TEST_ROOT/root/.acme.sh"
+    "$TEST_ROOT/root"
   export CERTMAN_CONFIG_DIR="$TEST_ROOT/etc/trojan-certman"
   export CERTMAN_CONFIG_FILE="$CERTMAN_CONFIG_DIR/config"
   export CERTMAN_SECRETS_DIR="$CERTMAN_CONFIG_DIR/secrets"
@@ -15,6 +15,7 @@ setup() {
   export CERTMAN_CF_TOKEN_FILE="$CERTMAN_SECRETS_DIR/cloudflare-token"
   export CERTMAN_STATE_DIR="$TEST_ROOT/var/lib/trojan-certman"
   export CERTMAN_STATUS_FILE="$CERTMAN_STATE_DIR/status"
+  export CERTMAN_INSTALL_TRANSACTION_FILE="$CERTMAN_STATE_DIR/install-transaction"
   export CERTMAN_ROLLBACK_ROOT="$CERTMAN_STATE_DIR/rollback"
   export CERTMAN_LEGACY_MIGRATION_DIR="$CERTMAN_STATE_DIR/legacy-migration"
   export CERTMAN_LOCK_FILE="$TEST_ROOT/run/lock/trojan-certman.lock"
@@ -40,6 +41,7 @@ setup() {
   export CERTMAN_LEGACY_CONFIG="$TEST_ROOT/legacy.json"
   export CERTMAN_SKIP_ROOT_CHECK=1
   export CERTMAN_SKIP_CHOWN=1
+  export CERTMAN_SKIP_LOCK=1
   # shellcheck source=../install-with-certman.sh
   source "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
@@ -84,6 +86,7 @@ seed_certificate_version() {
   [ "$ACME_VERSION" = 3.1.4 ]
   [ "$ACME_TARBALL_SHA256" = 9af3ad3d775a5782246df4cdd4b4e7b9b3179deb63c509b10e3ba0433093a884 ]
   [ "$ACME_SCRIPT_SHA256" = fcabf274d4f96966ec933879ae0257266e8ef2f7d16161f14b84dd896c0cac32 ]
+  [ "$ACME_DNS_CF_SHA256" = 9628ee8238cb3f9cfa1b1a985c0e9593436a3e4f8a9d65a6f775b981be9e76c8 ]
   grep -Fq -- '--no-cron --no-profile' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
   grep -Fq -- 'NO_DETECT_SH=1' "$BATS_TEST_DIRNAME/../install-with-certman.sh"
 }
@@ -139,6 +142,434 @@ seed_certificate_version() {
   write_xray_config
   after=$(sha256sum "$XRAY_CONFIG" | awk '{print $1}')
   [ "$before" = "$after" ]
+}
+
+@test "install is a no-op for an already healthy managed node" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$CERTMAN_PASSWORD_FILE"
+  printf '%s' fixture-cloudflare-token >"$CERTMAN_CF_TOKEN_FILE"
+  chmod 0600 "$CERTMAN_PASSWORD_FILE" "$CERTMAN_CF_TOKEN_FILE"
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  write_config
+  write_xray_config
+  install_self
+  install -m 0644 "$CERTMAN_ASSET_DIR/xray.service" "$CERTMAN_SYSTEMD_DIR/xray.service"
+  install -d "$XRAY_VERSIONS_DIR/healthy"
+  printf '#!/usr/bin/env bash\nprintf "Xray 26.3.27\\n"\n' >"$XRAY_VERSIONS_DIR/healthy/xray"
+  chmod 0755 "$XRAY_VERSIONS_DIR/healthy/xray"
+  printf '%s\n' "$(xray_sha_for_arch "$(normalize_arch "$(uname -m)")")" \
+    >"$XRAY_VERSIONS_DIR/healthy/.archive.sha256"
+  atomic_symlink "$XRAY_VERSIONS_DIR/healthy" "$XRAY_CURRENT"
+  atomic_symlink "$XRAY_CURRENT/xray" "$XRAY_BIN"
+  for unit in "${SYSTEMD_UNITS[@]}"; do
+    install -m 0644 "$CERTMAN_ASSET_DIR/$unit" "$CERTMAN_SYSTEMD_DIR/$unit"
+  done
+  make_certificate 30 example.com "$TEST_ROOT/healthy.key" "$TEST_ROOT/healthy.pem"
+  seed_certificate_version healthy "$TEST_ROOT/healthy.pem" "$TEST_ROOT/healthy.key"
+  unset TROJAN_PORT
+
+  preflight_os() { :; }
+  acme_home_is_trusted() { printf checked >"$TEST_ROOT/acme-trust-checked"; return 0; }
+  xray_config_test() { return 0; }
+  verify_live_certificate() { return 0; }
+  systemctl() {
+    case "$1:$2:$3" in
+      'is-active:--quiet:xray.service') return 0 ;;
+      'is-enabled:--quiet:xray.service') printf checked >"$TEST_ROOT/xray-enabled"; return 0 ;;
+      'is-enabled:--quiet:trojan-certman-renew.timer'|'is-enabled:--quiet:trojan-certman-snapshot.timer') return 0 ;;
+      'is-active:--quiet:trojan-certman-renew.timer') printf checked >"$TEST_ROOT/renew-active"; return 0 ;;
+      'is-active:--quiet:trojan-certman-snapshot.timer') printf checked >"$TEST_ROOT/snapshot-active"; return 0 ;;
+      'show:xray.service:-p') printf checked >"$TEST_ROOT/mainpid-checked"; printf '1\n'; return 0 ;;
+      *) printf '%s\n' "$*" >>"$TEST_ROOT/mutation.log" ;;
+    esac
+  }
+  install_dependencies() { printf dependencies >>"$TEST_ROOT/mutation.log"; }
+  create_xray_user() { printf user >>"$TEST_ROOT/mutation.log"; }
+  install_xray_release() { printf xray >>"$TEST_ROOT/mutation.log"; }
+  install_pinned_acme() { printf acme >>"$TEST_ROOT/mutation.log"; }
+  issue_certificate_dns() { printf certificate >>"$TEST_ROOT/mutation.log"; }
+  ss() { printf 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=1,fd=3))\n'; }
+
+  run install_new
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'already installed and healthy'* ]]
+  [ -e "$TEST_ROOT/renew-active" ]
+  [ -e "$TEST_ROOT/snapshot-active" ]
+  [ -e "$TEST_ROOT/acme-trust-checked" ]
+  [ -e "$TEST_ROOT/xray-enabled" ]
+  [ -e "$TEST_ROOT/mainpid-checked" ]
+  [ ! -e "$TEST_ROOT/mutation.log" ]
+}
+
+@test "clean install succeeds and the identical second run preserves runtime state" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  mkdir -p "$TEST_ROOT/service-active" "$TEST_ROOT/service-enabled"
+
+  preflight_os() { :; }
+  ss() {
+    [[ -e "$TEST_ROOT/service-active/xray.service" ]] \
+      && printf 'LISTEN 0 4096 *:443 *:* users:(("xray",pid=4242,fd=3))\n'
+    return 0
+  }
+  install_dependencies() { printf 'dependencies\n' >>"$TEST_ROOT/install-calls"; }
+  create_xray_user() { printf 'user\n' >>"$TEST_ROOT/install-calls"; }
+  install_xray_release() {
+    local target="$XRAY_VERSIONS_DIR/fresh"
+    install -d "$target"
+    printf '#!/usr/bin/env bash\nprintf "Xray 26.3.27\\n"\n' >"$target/xray"
+    chmod 0755 "$target/xray"
+    printf '%s\n' "$(xray_sha_for_arch "$(normalize_arch "$(uname -m)")")" >"$target/.archive.sha256"
+    atomic_symlink "$target" "$XRAY_CURRENT"
+    atomic_symlink "$XRAY_CURRENT/xray" "$XRAY_BIN"
+    printf 'xray\n' >>"$TEST_ROOT/install-calls"
+  }
+  install_pinned_acme() {
+    install -d "$ACME_HOME/dnsapi"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$ACME_BIN"
+    printf plugin >"$ACME_HOME/dnsapi/dns_cf.sh"
+    chmod 0755 "$ACME_BIN"
+    write_acme_pin_marker
+    printf 'acme\n' >>"$TEST_ROOT/install-calls"
+  }
+  acme_home_is_trusted() { [[ -r $ACME_PIN_FILE ]]; }
+  issue_certificate_dns() {
+    ACME_CERT_FILE="${ACME_HOME}/${CERT_DOMAIN}_ecc/fullchain.cer"
+    ACME_KEY_FILE="${ACME_HOME}/${CERT_DOMAIN}_ecc/${CERT_DOMAIN}.key"
+    install -d "$(dirname "$ACME_CERT_FILE")"
+    make_certificate 30 "$CERT_DOMAIN" "$ACME_KEY_FILE" "$ACME_CERT_FILE"
+    printf 'certificate\n' >>"$TEST_ROOT/install-calls"
+  }
+  clear_acme_legacy_deploy_state() { :; }
+  configure_capacity() {
+    install -d "$(dirname "$SYSCTL_FILE")" "$STATE_DIR"
+    printf 'net.core.somaxconn=128\n' >"$STATE_DIR/sysctl-before"
+    printf 'net.core.somaxconn = 4096\n' >"$SYSCTL_FILE"
+  }
+  deploy_certificate_locked() {
+    install -d "$XRAY_TLS_CURRENT"
+    install -m 0644 "$1" "$XRAY_TLS_CURRENT/fullchain.pem"
+    install -m 0640 "$2" "$XRAY_TLS_CURRENT/private.key"
+    printf 4242 >"$TEST_ROOT/main-pid"
+    printf 0 >"$TEST_ROOT/restarts"
+    touch "$TEST_ROOT/service-active/xray.service"
+  }
+  xray_config_test() { return 0; }
+  verify_live_certificate() { return 0; }
+  systemctl() {
+    local action=$1 name
+    shift
+    case $action in
+      daemon-reload) return 0 ;;
+      enable)
+        for name in "$@"; do touch "$TEST_ROOT/service-enabled/$name"; done
+        ;;
+      start)
+        for name in "$@"; do touch "$TEST_ROOT/service-active/$name"; done
+        ;;
+      is-active)
+        [[ ${1:-} == --quiet ]] && shift
+        [[ -e "$TEST_ROOT/service-active/$1" ]]
+        ;;
+      is-enabled)
+        [[ ${1:-} == --quiet ]] && shift
+        [[ -e "$TEST_ROOT/service-enabled/$1" ]]
+        ;;
+      show)
+        [[ $1 == xray.service ]]
+        cat "$TEST_ROOT/main-pid"
+        ;;
+      *) return 0 ;;
+    esac
+  }
+
+  install_new
+  first_pid=$(<"$TEST_ROOT/main-pid")
+  first_restarts=$(<"$TEST_ROOT/restarts")
+  first_config_sha=$(sha256sum "$XRAY_CONFIG" | awk '{print $1}')
+  first_cert_sha=$(certificate_fingerprint_file "$XRAY_TLS_CURRENT/fullchain.pem")
+  first_calls=$(wc -l <"$TEST_ROOT/install-calls")
+
+  install_new
+
+  [ "$(<"$TEST_ROOT/main-pid")" = "$first_pid" ]
+  [ "$(<"$TEST_ROOT/restarts")" = "$first_restarts" ]
+  [ "$(sha256sum "$XRAY_CONFIG" | awk '{print $1}')" = "$first_config_sha" ]
+  [ "$(certificate_fingerprint_file "$XRAY_TLS_CURRENT/fullchain.pem")" = "$first_cert_sha" ]
+  [ "$(wc -l <"$TEST_ROOT/install-calls")" = "$first_calls" ]
+  [ ! -e "$INSTALL_TRANSACTION_FILE" ]
+}
+
+@test "install rejects partial managed state before installing dependencies" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s\n' 'CERT_DOMAIN=example.com' >"$CERTMAN_CONFIG_FILE"
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'partial or conflicting managed state'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "fresh-install health probing never sources an untrusted residual config" {
+  printf '%s\n' \
+    'CERT_DOMAIN=$(touch "'"$TEST_ROOT"'/config-executed")' \
+    'TROJAN_PORT=443' >"$CERTMAN_CONFIG_FILE"
+  printf secret >"$CERTMAN_PASSWORD_FILE"
+  printf token >"$CERTMAN_CF_TOKEN_FILE"
+  printf '{}' >"$CERTMAN_XRAY_CONFIG"
+  mkdir -p "$(dirname "$CERTMAN_INSTALLED_BIN")"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$CERTMAN_XRAY_BIN"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$CERTMAN_INSTALLED_BIN"
+  chmod 0755 "$CERTMAN_XRAY_BIN" "$CERTMAN_INSTALLED_BIN"
+  install -m 0644 "$CERTMAN_ASSET_DIR/xray.service" "$CERTMAN_SYSTEMD_DIR/xray.service"
+  mkdir -p "$CERTMAN_XRAY_TLS_CURRENT"
+  printf cert >"$CERTMAN_XRAY_TLS_CURRENT/fullchain.pem"
+  printf key >"$CERTMAN_XRAY_TLS_CURRENT/private.key"
+
+  run managed_install_is_healthy example.com 443
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$TEST_ROOT/config-executed" ]
+}
+
+@test "install rejects missing secret inputs before installing dependencies" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  unset CERTMAN_PASSWORD_INPUT_FILE CERTMAN_CF_TOKEN_INPUT_FILE
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'password and Cloudflare token input files are required'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "install rejects an occupied 443 before installing dependencies" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { printf 'LISTEN 0 128 *:443 *:*\n'; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'port 443 is already in use'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "install rejects an invalid domain before installing dependencies" {
+  CERT_DOMAIN=not_a_dns_name
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+  ss() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'valid DNS name'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "install rejects an unowned acme home before installing dependencies" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  mkdir -p "$CERTMAN_ACME_HOME"
+  preflight_os() { :; }
+  ss() { return 0; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'not owned and pinned by certman'* ]]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "install rejects a multiline secret before installing dependencies" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf 'first-line\nsecond-line\n' >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  ss() { return 0; }
+  install_dependencies() { printf called >"$TEST_ROOT/dependencies-called"; return 1; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$TEST_ROOT/dependencies-called" ]
+}
+
+@test "failed fresh install cleans managed state but preserves dependencies and xray user" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  ss() { return 0; }
+  install_dependencies() { printf retained >"$TEST_ROOT/dependencies-retained"; }
+  create_xray_user() { printf retained >"$TEST_ROOT/xray-user-retained"; }
+  install_xray_release() {
+    install -d "$XRAY_VERSIONS_DIR/fresh"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$XRAY_VERSIONS_DIR/fresh/xray"
+    chmod 0755 "$XRAY_VERSIONS_DIR/fresh/xray"
+    atomic_symlink "$XRAY_VERSIONS_DIR/fresh" "$XRAY_CURRENT"
+    atomic_symlink "$XRAY_CURRENT/xray" "$XRAY_BIN"
+  }
+  install_pinned_acme() { :; }
+  issue_certificate_dns() {
+    ACME_CERT_FILE="$TEST_ROOT/issued.pem"
+    ACME_KEY_FILE="$TEST_ROOT/issued.key"
+    make_certificate 30 example.com "$ACME_KEY_FILE" "$ACME_CERT_FILE"
+  }
+  clear_acme_legacy_deploy_state() { :; }
+  install_systemd_units() {
+    local unit
+    for unit in "${SYSTEMD_UNITS[@]}"; do
+      install -m 0644 "$CERTMAN_ASSET_DIR/$unit" "$CERTMAN_SYSTEMD_DIR/$unit"
+    done
+    return 1
+  }
+  systemctl() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [ -e "$TEST_ROOT/dependencies-retained" ]
+  [ -e "$TEST_ROOT/xray-user-retained" ]
+  [ ! -e "$CERTMAN_CONFIG_FILE" ]
+  [ ! -e "$CERTMAN_PASSWORD_FILE" ]
+  [ ! -e "$CERTMAN_CF_TOKEN_FILE" ]
+  [ ! -e "$CERTMAN_XRAY_CONFIG" ]
+  [ ! -e "$CERTMAN_XRAY_BIN" ]
+  [ ! -e "$CERTMAN_INSTALLED_BIN" ]
+  [ ! -e "$CERTMAN_SYSTEMD_DIR/xray.service" ]
+  [ ! -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+}
+
+@test "fresh cleanup treats absent systemd units as already clean" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  ss() { return 0; }
+  install_dependencies() { :; }
+  create_xray_user() { :; }
+  install_xray_release() { return 1; }
+  systemctl() { return 5; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+  [ ! -e "$CERTMAN_PASSWORD_FILE" ]
+  [ ! -e "$CERTMAN_CF_TOKEN_FILE" ]
+}
+
+@test "failed fresh install removes an acme home created by the transaction" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  preflight_os() { :; }
+  ss() { return 0; }
+  install_dependencies() { :; }
+  create_xray_user() { :; }
+  install_xray_release() { :; }
+  install_pinned_acme() {
+    mkdir -p "$CERTMAN_ACME_HOME/dnsapi"
+    printf partial >"$CERTMAN_ACME_BIN"
+    return 1
+  }
+  systemctl() { return 0; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$CERTMAN_ACME_HOME" ]
+  [ ! -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+}
+
+@test "next install recovers an owned stale transaction before retrying" {
+  CERT_DOMAIN=example.com
+  TROJAN_PORT=443
+  printf '%s' fixture-personal-credential >"$TEST_ROOT/password-input"
+  printf '%s' fixture-cloudflare-token >"$TEST_ROOT/cloudflare-input"
+  export CERTMAN_PASSWORD_INPUT_FILE="$TEST_ROOT/password-input"
+  export CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  printf 'OWNER=trojan-certman-v3\nSTATE=in-progress\n' >"$CERTMAN_INSTALL_TRANSACTION_FILE"
+  printf partial >"$CERTMAN_PASSWORD_FILE"
+  printf partial >"$CERTMAN_CF_TOKEN_FILE"
+  printf partial >"$CERTMAN_XRAY_CONFIG"
+  preflight_os() { :; }
+  ss() { return 0; }
+  systemctl() { return 0; }
+  install_dependencies() { return 1; }
+
+  run install_new
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'dependency installation failed'* ]]
+  [ ! -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+  [ ! -e "$CERTMAN_PASSWORD_FILE" ]
+  [ ! -e "$CERTMAN_CF_TOKEN_FILE" ]
+  [ ! -e "$CERTMAN_XRAY_CONFIG" ]
+}
+
+@test "cleanup keeps the transaction marker when a managed unit was replaced" {
+  printf 'OWNER=trojan-certman-v3\nSTATE=in-progress\n' >"$CERTMAN_INSTALL_TRANSACTION_FILE"
+  printf '%s\n' '[Unit]' 'Description=foreign replacement' >"$CERTMAN_SYSTEMD_DIR/xray.service"
+  systemctl() { printf called >"$TEST_ROOT/systemctl-called"; }
+
+  run cleanup_fresh_install_transaction
+
+  [ "$status" -ne 0 ]
+  [ -e "$CERTMAN_INSTALL_TRANSACTION_FILE" ]
+  [ -e "$CERTMAN_SYSTEMD_DIR/xray.service" ]
+  [ ! -e "$TEST_ROOT/systemctl-called" ]
 }
 
 @test "candidate Xray config keeps a json suffix for format detection" {
@@ -313,6 +744,7 @@ seed_certificate_version() {
   ACME_KEY_FILE="$XRAY_TLS_CURRENT/private.key"
   printf '%s' 'fixture-cloudflare-token' >"$CERTMAN_CF_TOKEN_FILE"
   chmod 0600 "$CERTMAN_CF_TOKEN_FILE"
+  mkdir -p "$CERTMAN_ACME_HOME"
   cat >"$ACME_BIN" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$@" >"$TEST_ROOT/acme-args"
@@ -365,6 +797,7 @@ EOF
   make_certificate 60 example.com "$TEST_ROOT/issued.key" "$TEST_ROOT/issued.pem"
   printf '%s' 'fixture-cloudflare-token' >"$CERTMAN_CF_TOKEN_FILE"
   chmod 0600 "$CERTMAN_CF_TOKEN_FILE"
+  mkdir -p "$CERTMAN_ACME_HOME"
   cat >"$ACME_BIN" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$@" >"$TEST_ROOT/acme-issue-args"
@@ -385,8 +818,72 @@ EOF
   ! grep -R -Fq fixture-cloudflare-token "$TEST_ROOT/acme-issue-args" "$STATUS_FILE" 2>/dev/null
 }
 
+@test "DNS-01 issuance accepts rc 2 with a valid pair and scrubs persisted Cloudflare token" {
+  CERT_DOMAIN=example.com
+  mkdir -p "$CERTMAN_ACME_HOME/example.com_ecc"
+  make_certificate 60 example.com \
+    "$CERTMAN_ACME_HOME/example.com_ecc/example.com.key" \
+    "$CERTMAN_ACME_HOME/example.com_ecc/fullchain.cer"
+  printf '%s' fixture-cloudflare-token >"$CERTMAN_CF_TOKEN_FILE"
+  chmod 0600 "$CERTMAN_CF_TOKEN_FILE"
+  cat >"$ACME_BIN" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "SAVED_CF_Token='fixture-cloudflare-token'" >"$CERTMAN_ACME_HOME/account.conf"
+printf '%s\n' "CF_Token='fixture-cloudflare-token'" >"$CERTMAN_ACME_HOME/example.com_ecc/example.com.conf"
+exit 2
+EOF
+  chmod +x "$ACME_BIN"
+
+  run issue_certificate_dns
+
+  [ "$status" -eq 0 ]
+  ! grep -Fq fixture-cloudflare-token "$CERTMAN_ACME_HOME/account.conf"
+  ! grep -Fq fixture-cloudflare-token "$CERTMAN_ACME_HOME/example.com_ecc/example.com.conf"
+}
+
+@test "pinned acme refuses an unowned existing home without downloading" {
+  mkdir -p "$CERTMAN_ACME_HOME"
+  cat >"$ACME_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf 'acme.sh 3.1.4\n'
+EOF
+  chmod +x "$ACME_BIN"
+  ACME_SCRIPT_SHA256=$(sha256sum "$ACME_BIN" | awk '{print $1}')
+  curl() { printf called >"$TEST_ROOT/curl-called"; return 1; }
+
+  run install_pinned_acme
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'not owned and pinned by certman'* ]]
+  [ ! -e "$TEST_ROOT/curl-called" ]
+}
+
+@test "pinned acme refuses a modified Cloudflare DNS plugin" {
+  mkdir -p "$CERTMAN_ACME_HOME/dnsapi"
+  cat >"$ACME_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf 'acme.sh 3.1.4\n'
+EOF
+  printf '%s\n' '#!/usr/bin/env sh' 'printf modified' >"$CERTMAN_ACME_HOME/dnsapi/dns_cf.sh"
+  chmod +x "$ACME_BIN" "$CERTMAN_ACME_HOME/dnsapi/dns_cf.sh"
+  ACME_SCRIPT_SHA256=$(sha256sum "$ACME_BIN" | awk '{print $1}')
+  ACME_DNS_CF_SHA256=$(printf expected-plugin | sha256sum | awk '{print $1}')
+  cat >"$CERTMAN_ACME_HOME/.trojan-certman-pin" <<EOF
+VERSION=$ACME_VERSION
+COMMIT=$ACME_COMMIT
+SCRIPT_SHA256=$ACME_SCRIPT_SHA256
+DNS_CF_SHA256=$ACME_DNS_CF_SHA256
+EOF
+
+  run install_pinned_acme
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'not owned and pinned by certman'* ]]
+}
+
 @test "legacy acme deploy paths and reload command are cleared without a second restart" {
   CERT_DOMAIN=example.com
+  mkdir -p "$CERTMAN_ACME_HOME"
   cat >"$ACME_BIN" <<EOF
 #!/usr/bin/env bash
 printf '%q\n' "\$@" >"$TEST_ROOT/acme-install-cert-args"
