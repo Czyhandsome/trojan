@@ -203,6 +203,40 @@ seed_certificate_version() {
   grep -Fq 'LAST_STAGE=certificate-rollback' "$STATUS_FILE"
 }
 
+@test "first certificate failure stops Xray when no prior certificate exists" {
+  write_base_config
+  make_certificate 60 example.com "$TEST_ROOT/new.key" "$TEST_ROOT/new.pem"
+  candidate_config_test() { return 0; }
+  restart_and_verify_xray() { return 1; }
+  systemctl() { printf '%s %s\n' "$1" "${2:-}" >>"$TEST_ROOT/systemctl.log"; return 0; }
+
+  run deploy_certificate_locked "$TEST_ROOT/new.pem" "$TEST_ROOT/new.key"
+
+  [ "$status" -ne 0 ]
+  [ ! -e "$XRAY_TLS_CURRENT" ]
+  grep -Fxq 'stop xray.service' "$TEST_ROOT/systemctl.log"
+  ! grep -Fxq 'restart xray.service' "$TEST_ROOT/systemctl.log"
+}
+
+@test "live certificate verification retries until the listener is ready" {
+  write_base_config
+  make_certificate 60 example.com "$TEST_ROOT/current.key" "$TEST_ROOT/current.pem"
+  seed_certificate_version current "$TEST_ROOT/current.pem" "$TEST_ROOT/current.key"
+  fetch_live_certificate() {
+    local count=0
+    [[ -r $TEST_ROOT/fetch-count ]] && count=$(<"$TEST_ROOT/fetch-count")
+    count=$((count + 1))
+    printf '%s' "$count" >"$TEST_ROOT/fetch-count"
+    ((count >= 3)) || return 1
+    cp "$XRAY_TLS_CURRENT/fullchain.pem" "$1"
+  }
+  sleep() { :; }
+
+  verify_live_certificate
+
+  [ "$(<"$TEST_ROOT/fetch-count")" -eq 3 ]
+}
+
 @test "upgrade rejects a non-matching requested hash before download or switch" {
   write_base_config
   mkdir -p "$XRAY_VERSIONS_DIR/old"

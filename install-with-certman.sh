@@ -213,18 +213,36 @@ verify_certificate_pair() {
 current_cert_file() { printf '%s/fullchain.pem\n' "$XRAY_TLS_CURRENT"; }
 current_key_file() { printf '%s/private.key\n' "$XRAY_TLS_CURRENT"; }
 
-verify_live_certificate() {
-  local expected live temp
-  expected=$(current_cert_file)
-  temp=$(mktemp)
-  if ! timeout 15 openssl s_client -connect "127.0.0.1:${TROJAN_PORT}" -servername "$CERT_DOMAIN" </dev/null 2>/dev/null \
-      | openssl x509 -outform PEM >"$temp" 2>/dev/null; then
-    rm -f -- "$temp"
-    return 1
+fetch_live_certificate() {
+  local target=$1 raw
+  raw=$(mktemp)
+  if timeout 2 openssl s_client -connect "127.0.0.1:${TROJAN_PORT}" -servername "$CERT_DOMAIN" \
+      -showcerts </dev/null >"$raw" 2>/dev/null \
+      && openssl x509 -in "$raw" -outform PEM >"$target" 2>/dev/null; then
+    rm -f -- "$raw"
+    return 0
   fi
-  live=$(certificate_fingerprint_file "$temp")
+  rm -f -- "$raw"
+  return 1
+}
+
+verify_live_certificate() {
+  local expected live temp attempt
+  expected=$(current_cert_file)
+  [[ -r $expected ]] || return 1
+  temp=$(mktemp)
+  for ((attempt = 1; attempt <= 10; attempt++)); do
+    if fetch_live_certificate "$temp"; then
+      live=$(certificate_fingerprint_file "$temp")
+      if [[ -n $live && $live == "$(certificate_fingerprint_file "$expected")" ]]; then
+        rm -f -- "$temp"
+        return 0
+      fi
+    fi
+    sleep 0.2
+  done
   rm -f -- "$temp"
-  [[ $live == "$(certificate_fingerprint_file "$expected")" ]]
+  return 1
 }
 
 xray_config_test() {
@@ -281,6 +299,14 @@ restore_rollback_state() {
   fi
 }
 
+restore_xray_runtime_after_rollback() {
+  if [[ -r $(current_cert_file) && -r $(current_key_file) ]]; then
+    systemctl restart xray.service >/dev/null 2>&1 || true
+  else
+    systemctl stop xray.service >/dev/null 2>&1 || true
+  fi
+}
+
 restart_and_verify_xray() {
   systemctl restart xray.service || return 1
   systemctl is-active --quiet xray.service || return 1
@@ -320,7 +346,7 @@ deploy_certificate_locked() {
   atomic_symlink "$version_dir" "$XRAY_TLS_CURRENT"
   if ! restart_and_verify_xray; then
     restore_rollback_state || true
-    systemctl restart xray.service >/dev/null 2>&1 || true
+    restore_xray_runtime_after_rollback
     write_status failed certificate-rollback
     return 1
   fi
@@ -407,7 +433,7 @@ upgrade_xray_locked() {
   install_xray_release "$version" "$supplied_sha" 1
   if ! xray_config_test || ! restart_and_verify_xray; then
     restore_rollback_state || true
-    systemctl restart xray.service >/dev/null 2>&1 || true
+    restore_xray_runtime_after_rollback
     write_status failed upgrade-rollback
     return 1
   fi
