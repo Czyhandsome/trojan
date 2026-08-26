@@ -284,15 +284,20 @@ seed_certificate_version() {
   cmp "$TEST_ROOT/original-config" "$XRAY_CONFIG"
 }
 
-@test "renew calls acme cron without force and avoids a duplicate restart" {
+@test "renew uses file-sourced Cloudflare DNS-01 without force or duplicate restart" {
   write_base_config
   make_certificate 60 example.com "$TEST_ROOT/current.key" "$TEST_ROOT/current.pem"
   seed_certificate_version current "$TEST_ROOT/current.pem" "$TEST_ROOT/current.key"
   ACME_CERT_FILE="$XRAY_TLS_CURRENT/fullchain.pem"
   ACME_KEY_FILE="$XRAY_TLS_CURRENT/private.key"
+  printf '%s' 'fixture-cloudflare-token' >"$CERTMAN_CF_TOKEN_FILE"
+  chmod 0600 "$CERTMAN_CF_TOKEN_FILE"
   cat >"$ACME_BIN" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$@" >"$TEST_ROOT/acme-args"
+[[ -n \${CF_Token:-} ]] || exit 9
+printf present >"$TEST_ROOT/acme-renew-token-present"
+exit 2
 EOF
   chmod +x "$ACME_BIN"
   verify_live_certificate() { return 0; }
@@ -300,10 +305,38 @@ EOF
 
   run_renew_locked
 
-  grep -Fxq -- '--cron' "$TEST_ROOT/acme-args"
+  grep -Fxq -- '--issue' "$TEST_ROOT/acme-args"
+  grep -Fxq -- '--dns' "$TEST_ROOT/acme-args"
+  grep -Fxq -- 'dns_cf' "$TEST_ROOT/acme-args"
   ! grep -Fxq -- '--force' "$TEST_ROOT/acme-args"
+  [ "$(<"$TEST_ROOT/acme-renew-token-present")" = present ]
+  ! grep -R -Fq fixture-cloudflare-token "$TEST_ROOT/acme-args" "$STATUS_FILE" 2>/dev/null
   [ ! -e "$TEST_ROOT/deploy" ]
   grep -Fq 'LAST_STAGE=not-due' "$STATUS_FILE"
+}
+
+@test "cutover imports a root-only Cloudflare token before taking the lock" {
+  write_base_config
+  printf '%s' 'fixture-cloudflare-token' >"$TEST_ROOT/cloudflare-input"
+  chmod 0600 "$TEST_ROOT/cloudflare-input"
+  CERTMAN_CF_TOKEN_INPUT_FILE="$TEST_ROOT/cloudflare-input"
+  with_lock() { printf '%s' "$1" >"$TEST_ROOT/locked-command"; }
+
+  cutover
+
+  [ "$(file_mode "$CERTMAN_CF_TOKEN_FILE")" = 600 ]
+  [ "$(<"$CERTMAN_CF_TOKEN_FILE")" = fixture-cloudflare-token ]
+  [ "$(<"$TEST_ROOT/locked-command")" = cutover_locked ]
+}
+
+@test "cutover refuses a missing Cloudflare token before touching migration state" {
+  write_base_config
+
+  run cutover
+
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'Cloudflare token'* ]]
+  [ ! -e "$CERTMAN_LEGACY_MIGRATION_DIR" ]
 }
 
 @test "DNS-01 issuance passes a file-sourced token only through the acme environment" {

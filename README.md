@@ -76,6 +76,17 @@ trojan-certman rollback
 TLS 握手失败或线上指纹与磁盘不一致，`deploy-cert` 必须自动恢复旧证书。acme.sh
 只触发一次受控部署，不额外配置第二次 reload 或 restart。
 
+旧节点迁移首次执行 `cutover` 时还必须通过 root-only 文件提供 Cloudflare token：
+
+```bash
+sudo env CERTMAN_CF_TOKEN_INPUT_FILE=/root/secure-input/cloudflare-token \
+  /usr/local/sbin/trojan-certman-v3 cutover
+```
+
+token 会安装为 `/etc/trojan-certman-v3/secrets/cloudflare-token`（`0600 root:root`），
+不会进入命令行参数或日志。续签检查始终显式使用 `dns_cf`，不依赖旧证书保存的
+HTTP-01/webroot 方法；未到续签时间时接受 acme.sh 的 skip 状态，不使用 `--force`。
+
 ## Aiyun 迁移与回滚
 
 生产切换不是安装脚本的隐式步骤。以下步骤都要在现场回读后执行；停止旧服务、占用

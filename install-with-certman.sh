@@ -68,7 +68,8 @@ Usage:
 Provisioning inputs are passed as readable files, never as secret command
 arguments. install requires CERTMAN_PASSWORD_INPUT_FILE and
 CERTMAN_CF_TOKEN_INPUT_FILE. adopt requires only the password input file and
-does not read the password from the legacy configuration.
+does not read the password from the legacy configuration. The first cutover
+requires CERTMAN_CF_TOKEN_INPUT_FILE unless a token was already installed.
 EOF
 }
 
@@ -121,12 +122,12 @@ read_link_or_empty() {
 
 install_secret_file() {
   local target=$1 input=$2 temp
-  [[ -f $input ]] || die 'password input file not found'
+  [[ -f $input ]] || die 'secret input file not found'
   install -d -m 0700 "$SECRETS_DIR"
   temp=$(mktemp "${SECRETS_DIR}/.secret.XXXXXX")
   chmod 0600 "$temp"
   tr -d '\r\n' <"$input" >"$temp"
-  [[ -s $temp ]] || { rm -f -- "$temp"; die 'password input file is empty'; }
+  [[ -s $temp ]] || { rm -f -- "$temp"; die 'secret input file is empty'; }
   mv -f "$temp" "$target"
   chmod 0600 "$target"
   safe_chown root:root "$target" 2>/dev/null || true
@@ -465,7 +466,7 @@ install_pinned_acme() {
   if [[ -x $ACME_BIN ]]; then
     installed_sha=$(sha256sum "$ACME_BIN" | awk '{print $1}')
     if [[ $installed_sha == "$ACME_SCRIPT_SHA256" ]] \
-        && "$ACME_BIN" --version 2>/dev/null | grep -Fq "$ACME_VERSION"; then
+        && [[ $("$ACME_BIN" --version 2>/dev/null) == *"$ACME_VERSION"* ]]; then
       return 0
     fi
   fi
@@ -503,12 +504,14 @@ run_renew() { require_root; load_config; with_lock run_renew_locked; }
 run_renew_locked() {
   local before after rc
   [[ -x $ACME_BIN ]] || { write_status failed missing-acme; return 1; }
+  [[ -s $CF_TOKEN_FILE ]] || { write_status failed missing-cloudflare-token; return 1; }
   before=$(certificate_fingerprint_file "$(current_cert_file)" 2>/dev/null || true)
   set +e
-  "$ACME_BIN" --cron --home "$ACME_HOME"
+  CF_Token=$(tr -d '\r\n' <"$CF_TOKEN_FILE") "$ACME_BIN" --issue --home "$ACME_HOME" \
+    --dns dns_cf -d "$CERT_DOMAIN" --server letsencrypt --keylength ec-256
   rc=$?
   set -e
-  ((rc == 0)) || { write_status failed renewal; return "$rc"; }
+  ((rc == 0 || rc == 2)) || { write_status failed renewal; return "$rc"; }
   [[ -r $ACME_CERT_FILE && -r $ACME_KEY_FILE ]] || { write_status success not-due; return 0; }
   after=$(certificate_fingerprint_file "$ACME_CERT_FILE" 2>/dev/null || true)
   if [[ -n $after && $after != "$before" ]]; then
@@ -823,7 +826,15 @@ rollback_legacy_locked() {
   log 'legacy Trojan services and the loopback Xray canary were restored'
 }
 
-cutover() { require_root; load_config; with_lock cutover_locked; }
+cutover() {
+  require_root
+  if [[ -n ${CERTMAN_CF_TOKEN_INPUT_FILE:-} ]]; then
+    install_secret_file "$CF_TOKEN_FILE" "$CERTMAN_CF_TOKEN_INPUT_FILE"
+  fi
+  [[ -s $CF_TOKEN_FILE ]] || die 'cutover requires a root-only Cloudflare token input file'
+  load_config
+  with_lock cutover_locked
+}
 
 perform_cutover() {
   systemctl stop xray.service || return 1
