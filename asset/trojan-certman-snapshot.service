@@ -1,0 +1,14 @@
+[Unit]
+Description=Write one non-secret Xray health snapshot to journald
+After=xray.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/trojan-certman snapshot
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true

@@ -1,31 +1,193 @@
-name: certman-ci
+name: v3-ci
 
 on:
   pull_request:
-    paths:
-      - install-with-certman.sh
-      - tests/**
-      - .github/workflows/certman-ci.yml
   push:
     branches: [master]
-    paths:
-      - install-with-certman.sh
-      - tests/**
-      - .github/workflows/certman-ci.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  shell:
-    runs-on: ubuntu-24.04
+  quality:
+    name: quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Install test tools
-        run: sudo apt-get update && sudo apt-get install -y bats shellcheck
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats ripgrep shellcheck
+
+      - name: Reject retired and mutable delivery surfaces
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          legacy_files=(
+            main.go build.sh install.sh go.mod go.sum
+            asset/Dockerfile asset/asset.go asset/trojan-install.sh
+            asset/trojan-web.service asset/client.json asset/clash-rules.yaml
+            asset/1.png asset/2.png asset/jetbrains.svg
+            .github/workflows/docker-publish.yml
+          )
+          for path in "${legacy_files[@]}"; do
+            if [[ -e "$path" ]]; then
+              echo "retired path is active: $path" >&2
+              exit 1
+            fi
+          done
+
+          for path in cmd core trojan util web; do
+            if [[ -d "$path" ]] && find "$path" -type f -print -quit | grep -q .; then
+              echo "retired source tree is active: $path" >&2
+              exit 1
+            fi
+          done
+
+          if rg -n 'releases/latest|/latest/|git\.io|curl[^|]+\|[[:space:]]*(bash|sh)|:[[:space:]]*latest' \
+            install-with-certman.sh asset; then
+            echo 'mutable or pipe-executed download is forbidden' >&2
+            exit 1
+          fi
+
+          while IFS= read -r action; do
+            if [[ ! "$action" =~ @[0-9a-f]{40}([[:space:]]|$) ]]; then
+              echo "GitHub Action is not pinned to a full commit SHA: $action" >&2
+              exit 1
+            fi
+          done < <(rg '^[[:space:]]*uses:' .github/workflows)
+
       - name: Parse shell
         run: bash -n install-with-certman.sh
+
       - name: ShellCheck
         run: shellcheck -x install-with-certman.sh
+
       - name: Bats
         run: bats tests/certman.bats
+
+      - name: Verify systemd units
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mapfile -t units < <(find asset -maxdepth 1 -type f \
+            \( -name '*.service' -o -name '*.timer' \) -print | sort)
+          if (( ${#units[@]} == 0 )); then
+            echo 'no systemd units found' >&2
+            exit 1
+          fi
+
+          verify_dir="$RUNNER_TEMP/systemd-units"
+          install -d "$verify_dir"
+          for unit in "${units[@]}"; do
+            sed -E \
+              's#^(Exec(Start|StartPre|StartPost|Reload|Stop|StopPost))=.*#\1=/bin/true#' \
+              "$unit" >"$verify_dir/${unit##*/}"
+          done
+          systemd-analyze verify "$verify_dir"/*
+
+  release-assets:
+    name: pinned release assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify pinned Xray and acme.sh archives
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          constant() {
+            local name=$1
+            sed -n "s/^${name}=\"\([^\"]*\)\"$/\1/p" install-with-certman.sh
+          }
+
+          xray_version=$(constant XRAY_VERSION)
+          acme_commit=$(constant ACME_COMMIT)
+          acme_sha256=$(constant ACME_TARBALL_SHA256)
+          acme_script_sha256=$(constant ACME_SCRIPT_SHA256)
+          acme_dns_cf_sha256=$(constant ACME_DNS_CF_SHA256)
+          stage="$RUNNER_TEMP/release-assets"
+          install -d "$stage"
+
+          assets=(
+            "Xray-linux-64.zip XRAY_AMD64_SHA256"
+            "Xray-linux-arm64-v8a.zip XRAY_ARM64_SHA256"
+          )
+          for entry in "${assets[@]}"; do
+            read -r asset checksum_name <<<"$entry"
+            expected=$(constant "$checksum_name")
+            curl -fsSL --proto '=https' --tlsv1.2 \
+              "https://github.com/XTLS/Xray-core/releases/download/${xray_version}/${asset}" \
+              -o "$stage/$asset"
+            printf '%s  %s\n' "$expected" "$stage/$asset" | sha256sum --check --strict
+          done
+
+          curl -fsSL --proto '=https' --tlsv1.2 \
+            "https://github.com/acmesh-official/acme.sh/archive/${acme_commit}.tar.gz" \
+            -o "$stage/acme.sh.tar.gz"
+          printf '%s  %s\n' "$acme_sha256" "$stage/acme.sh.tar.gz" \
+            | sha256sum --check --strict
+
+          tar -xzf "$stage/acme.sh.tar.gz" -C "$stage"
+          acme_source="$stage/acme.sh-${acme_commit}"
+          printf '%s  %s\n' "$acme_script_sha256" "$acme_source/acme.sh" \
+            | sha256sum --check --strict
+          printf '%s  %s\n' "$acme_dns_cf_sha256" "$acme_source/dnsapi/dns_cf.sh" \
+            | sha256sum --check --strict
+          (cd "$acme_source" && HOME="$stage/home" NO_DETECT_SH=1 ./acme.sh \
+            --install --home "$stage/acme-home" --no-cron --no-profile)
+          printf '%s  %s\n' "$acme_script_sha256" "$stage/acme-home/acme.sh" \
+            | sha256sum --check --strict
+          printf '%s  %s\n' "$acme_dns_cf_sha256" "$stage/acme-home/dnsapi/dns_cf.sh" \
+            | sha256sum --check --strict
+
+      - name: Check Xray Trojan inbound compatibility
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          stage="$RUNNER_TEMP/release-assets"
+          xray_dir="$stage/xray-amd64"
+          install -d "$xray_dir"
+          unzip -q "$stage/Xray-linux-64.zip" -d "$xray_dir"
+
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj '/CN=example.test' -addext 'subjectAltName=DNS:example.test' \
+            -keyout "$stage/key.pem" -out "$stage/cert.pem" >/dev/null 2>&1
+
+          export CERTMAN_CONFIG_DIR="$stage/certman"
+          export CERTMAN_CONFIG_FILE="$CERTMAN_CONFIG_DIR/config"
+          export CERTMAN_SECRETS_DIR="$CERTMAN_CONFIG_DIR/secrets"
+          export CERTMAN_PASSWORD_FILE="$CERTMAN_SECRETS_DIR/trojan-password"
+          export CERTMAN_XRAY_CONFIG_DIR="$stage/xray-config"
+          export CERTMAN_XRAY_CONFIG="$CERTMAN_XRAY_CONFIG_DIR/config.json"
+          export CERTMAN_XRAY_TLS_ROOT="$CERTMAN_XRAY_CONFIG_DIR/tls"
+          export CERTMAN_XRAY_TLS_CURRENT="$CERTMAN_XRAY_TLS_ROOT/current"
+          export CERTMAN_SKIP_CHOWN=1
+          # shellcheck source=install-with-certman.sh
+          source ./install-with-certman.sh
+
+          CERT_DOMAIN=example.test
+          TROJAN_PORT=18443
+          install -d -m 0700 "$CERTMAN_SECRETS_DIR"
+          install -d -m 0750 "$CERTMAN_XRAY_TLS_CURRENT"
+          install -m 0600 /dev/null "$CERTMAN_PASSWORD_FILE"
+          printf '%s' 'ci-placeholder-not-a-production-secret' >"$CERTMAN_PASSWORD_FILE"
+          install -m 0644 "$stage/cert.pem" "$CERTMAN_XRAY_TLS_CURRENT/fullchain.pem"
+          install -m 0640 "$stage/key.pem" "$CERTMAN_XRAY_TLS_CURRENT/private.key"
+          write_xray_config
+          "$xray_dir/xray" run -test -config "$CERTMAN_XRAY_CONFIG"
