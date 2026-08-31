@@ -79,6 +79,67 @@ trojan-node deploy --node NODE [--rotate-secrets] [--apply]
 trojan-node verify --node NODE
 ```
 
+### 自动化部署一台新机器
+
+下面按 `aiyun2` 举例；部署 `aiyun` 时只替换 `NODE`。一次只处理一台，不要把两个节点
+写进循环。开始前需要满足：VPS 是 clean Ubuntu 24.04、当前 Mac 已能用 key-only SSH
+登录、Cloudflare 管理 token 已存入 `personal` profile、Homebrew 已安装 Mihomo。
+
+```bash
+git clone https://github.com/Czyhandsome/trojan.git
+cd trojan
+
+brew install mihomo
+creds set generic cloudflare-czyhandsome token-manager \
+  --profile personal --stdin
+
+NODE=aiyun2
+bin/trojan-node host check --node "$NODE"
+bin/trojan-node credentials status --node "$NODE"
+bin/trojan-node cloudflare dns list --node "$NODE"
+bin/trojan-node preflight --node "$NODE"
+```
+
+`credentials status` 在 fresh install 前显示两个字段 `MISSING` 是正常的，管理 token 不在
+这个输出里。`preflight` 必须确认 DNS 为 `ready`、系统为 Ubuntu 24.04、443 空闲、远端
+`STATE` 为 `clean`。若只差 A 记录，先预览并执行受限的 DNS 修正：
+
+```bash
+bin/trojan-node cloudflare dns ensure --node "$NODE"
+bin/trojan-node preflight --node "$NODE"
+```
+
+`dns ensure` 只会创建缺失的 DNS-only A，或修正唯一同名 A 的 IP、TTL 和代理状态。
+多 A、AAAA、CNAME 或 zone 不唯一时会拒绝执行，需要人工在 Cloudflare 核对，不能靠删除
+记录“试出来”。
+
+preflight 通过后，先看一次脱敏部署计划，再执行同一计划：
+
+```bash
+bin/trojan-node deploy --node "$NODE" --rotate-secrets
+bin/trojan-node deploy --node "$NODE" --rotate-secrets --apply
+```
+
+第二条命令会再次打印节点、域名、Git commit、归档 SHA-256 和 DNS action，并要求输入完整
+节点名。确认后它才生成独立 Trojan 密码和受 VPS `/32` 限制的 Cloudflare DNS token，
+写入 Keychain，安装远端 Xray，并运行隔离 Mihomo、20 次 GCP SSH 重连和 60 分钟
+keepalive。整个命令可能运行一个多小时；最终出现 `"installed": true`、
+`"idempotent": true` 才算完成。中途失败时保留第一条错误，不要马上重复 `--rotate-secrets`。
+
+日后验证已安装节点使用：
+
+```bash
+bin/trojan-node verify --node "$NODE"
+```
+
+同一精确源码的 managed no-op 重跑使用 `deploy --node "$NODE" --apply`，不带
+`--rotate-secrets`。provenance 与当前 Git commit 或归档 SHA-256 不一致时会拒绝；这不是
+让人覆盖标记的提示，而是要求回到实际部署该节点的精确 commit，或按一次明确升级处理。
+
+`credentials rotate` 和 `cloudflare token rotate-dns` 只更新 Cloudflare/Keychain，不能单独
+把新 secret 安装进已经运行的 VPS。它们适合 fresh install 的准备和故障补偿，不是线上节点
+的独立换密命令。
+
 `deploy` 默认只打印脱敏计划；`--apply` 会显示精确节点、DNS action、Git commit、archive
 SHA-256 和远端动作，并要求输入完整节点名。它从干净 worktree 的精确 commit 构建 tar，
 通过严格 ED25519 临时 `known_hosts` 传入远端 staging，回读 SHA-256，再把 password/token
@@ -295,6 +356,211 @@ trojan-certman snapshot
 
 完整且健康的托管安装再次运行同一安装命令时只验证状态并成功返回，不续签、不重启、
 不改配置。若重跑时继续提供 secret 输入，它们必须与已安装值一致，否则无修改失败。
+
+## 常用机器操作
+
+下面的命令不依赖 AI。先分清执行位置：标有“服务器”的命令在 VPS 的 root shell 执行；
+标有“Mac”的命令在本机执行。不要把密码、完整 Trojan URI 或生成后的 YAML 粘贴到 issue、
+聊天、shell 参数或 Git 仓库。
+
+### 看服务、端口、证书和最近日志（服务器）
+
+```bash
+sudo -i
+
+trojan-certman status
+trojan-certman snapshot
+systemctl show xray.service -p ActiveState -p SubState -p MainPID -p NRestarts
+systemctl is-active trojan-certman-renew.timer trojan-certman-snapshot.timer
+systemctl is-enabled trojan-certman-renew.timer trojan-certman-snapshot.timer
+ss -lntp 'sport = :443'
+ss -lntp 'sport = :80 or sport = :18443 or sport = :34384'
+
+journalctl -u xray.service --since '1 hour ago' --no-pager
+journalctl -u trojan-certman-renew.service --since '24 hours ago' --no-pager
+journalctl -u trojan-certman-snapshot.service --since '1 hour ago' --no-pager
+```
+
+正常节点应满足：Xray 为 active，`NRestarts` 没有异常增长，443 owner 是 Xray、queue 上限
+为 4096，80/18443/34384 没有监听，两个 timer 均 active/enabled。`snapshot` 里的
+ListenDrops/Overflows 要看增量；历史累计值不为 0 不等于此刻正在丢连接。
+
+公网 TLS 要从另一台机器检查，不能只连接 `127.0.0.1`：
+
+```bash
+DOMAIN=introspect2.czyhandsome.ink
+openssl s_client -connect "$DOMAIN:443" -servername "$DOMAIN" \
+  -verify_return_error </dev/null 2>/dev/null \
+  | openssl x509 -noout -dates -fingerprint -sha256 -ext subjectAltName
+```
+
+SAN 必须包含目标域名，证书未过期，握手不得依赖 `-verify 0` 或跳过校验。
+
+### 只复制原始 Trojan 密码（Mac）
+
+密码正式保存在服务器的
+`/etc/trojan-certman-v3/secrets/trojan-password`，权限应为 `root:root 600`。确实需要原始
+密码时直接通过 SSH 管道写入 macOS 剪贴板，避免先显示在终端：
+
+```bash
+SSH_TARGET=root@aiyun2
+ssh "$SSH_TARGET" \
+  'exec cat /etc/trojan-certman-v3/secrets/trojan-password' \
+  | pbcopy
+```
+
+这条命令的 stdout 就是 secret。不要加 `tee`、调试回显或保存 shell trace。粘贴到目标客户端
+后可用 `pbcopy </dev/null` 清空剪贴板。若只想确认文件健康，不读取正文：
+
+```bash
+ssh "$SSH_TARGET" \
+  'stat -c "%U:%G %a %s %n" /etc/trojan-certman-v3/secrets/trojan-password'
+```
+
+### 生成 Trojan URI 并复制到剪贴板（Mac）
+
+Trojan URI 是单节点导入链接，不是在线订阅服务。下面从服务器读取密码，通过 stdin 交给
+本机 Python 做 URL encoding，最终只进入剪贴板：
+
+```bash
+SSH_TARGET=root@aiyun2
+DOMAIN=introspect2.czyhandsome.ink
+NODE_NAME=aiyun2
+
+ssh "$SSH_TARGET" \
+  'exec cat /etc/trojan-certman-v3/secrets/trojan-password' \
+  | python3 -c '
+import sys
+from urllib.parse import quote
+
+domain, name = sys.argv[1:]
+raw = sys.stdin.read()
+password = raw[:-1] if raw.endswith("\n") else raw
+if not password or "\n" in password or "\r" in password:
+    raise SystemExit("invalid password input")
+encoded_password = quote(password, safe="")
+encoded_domain = quote(domain, safe="")
+encoded_name = quote(name, safe="")
+print(f"trojan://{encoded_password}@{domain}:443?sni={encoded_domain}#{encoded_name}")
+' "$DOMAIN" "$NODE_NAME" \
+  | pbcopy
+```
+
+不同客户端对 URI 的可选参数支持不完全一致；必需信息只有协议 `trojan`、域名、443、密码、
+SNI 和严格证书校验。客户端若不接受该 URI，使用下一节 YAML；导入后确认客户端没有开启
+`allowInsecure` / `skip-cert-verify`，不要把跳过证书校验当成修复手段。
+
+### 生成最小 Clash/Mihomo YAML（Mac）
+
+下面把配置写到本机 root-only 风格的 `0600` 文件，不修改 Clash Verge 当前配置：
+
+```bash
+SSH_TARGET=root@aiyun2
+DOMAIN=introspect2.czyhandsome.ink
+NODE_NAME=aiyun2
+OUTPUT="$HOME/Downloads/${NODE_NAME}-trojan.yaml"
+
+umask 077
+ssh "$SSH_TARGET" \
+  'exec cat /etc/trojan-certman-v3/secrets/trojan-password' \
+  | python3 -c '
+import json
+import sys
+
+domain, name = sys.argv[1:]
+raw = sys.stdin.read()
+password = raw[:-1] if raw.endswith("\n") else raw
+if not password or "\n" in password or "\r" in password:
+    raise SystemExit("invalid password input")
+print("proxies:")
+print(f"  - name: {json.dumps(name, ensure_ascii=False)}")
+print("    type: trojan")
+print(f"    server: {json.dumps(domain)}")
+print("    port: 443")
+print(f"    password: {json.dumps(password)}")
+print(f"    sni: {json.dumps(domain)}")
+print("    skip-cert-verify: false")
+print("    udp: true")
+' "$DOMAIN" "$NODE_NAME" >"$OUTPUT"
+
+chmod 0600 "$OUTPUT"
+ls -l "$OUTPUT"
+```
+
+该 YAML 含明文密码。导入后要么把它移入受控配置目录，要么删除；不要放进 iCloud 公共目录、
+Git 仓库或聊天附件。仓库不提供 HTTP subscription endpoint，因此不存在可以长期公开访问的
+“订阅地址”。
+
+### 改配置前检查，必要时受控重启（服务器）
+
+只读检查配置：
+
+```bash
+/usr/local/bin/xray run -test -config /etc/xray/config.json
+```
+
+测试通过后，确实需要应用人工改动时才重启：
+
+```bash
+systemctl restart xray.service
+systemctl is-active xray.service
+systemctl show xray.service -p MainPID -p NRestarts
+trojan-certman snapshot
+```
+
+不要把“重启后 active”当成完整验收；还要检查公网 TLS 和真实代理出口。正常续签、状态查看
+和 snapshot 不需要手工重启 Xray。
+
+### 证书续签与定时任务（服务器）
+
+```bash
+systemctl list-timers 'trojan-certman-*' --all
+trojan-certman renew
+trojan-certman status
+journalctl -u trojan-certman-renew.service -n 100 --no-pager
+```
+
+`renew` 是正常到期检查，不会强制签发；证书未到续签时间时成功 skip 是正常结果。不要额外
+给 acme.sh 配第二个 reload command，也不要日常使用 `--force`。
+
+### 常见连接故障怎么分层（Mac 与服务器）
+
+```bash
+# Mac：DNS、TCP、TLS
+dig +short A introspect2.czyhandsome.ink
+nc -vz introspect2.czyhandsome.ink 443
+openssl s_client -connect introspect2.czyhandsome.ink:443 \
+  -servername introspect2.czyhandsome.ink -verify_return_error </dev/null
+
+# 服务器：进程、队列、计数器、日志
+trojan-certman snapshot
+systemctl show xray.service -p MainPID -p NRestarts
+ss -lntp 'sport = :443'
+journalctl -u xray.service --since '15 minutes ago' --no-pager
+```
+
+- TCP 443 不通：先查云防火墙、安全组、进程和监听者，不要先改 Trojan 密码。
+- TLS 失败：查 DNS、SNI、SAN、到期时间和线上/磁盘指纹，不要关闭证书校验。
+- TLS 正常但代理失败：查密码、客户端 `type: trojan`、443、SNI 和客户端实际选中的节点。
+- 代理网页正常但 SSH keepalive 断：同时看本地网络切换、代理出口变化、GCP 目标和
+  `ListenDrops/Overflows` 增量，不能只怪 Xray。
+- SSH 管理口在 `kex_exchange_identification` 前被关闭，但从其他出口能读到 banner：通常是
+  当前出口 IP 被云侧或 sshd 临时限流；先停止密集重试并切回可信出口，不要删除 host key。
+
+### 服务器重装后处理 SSH host key（Mac）
+
+重装系统后 host key 正常会变化。先在云厂商控制台核对新机器身份和 ED25519 指纹，再更新
+本机记录；不能看到警告就直接关闭严格校验：
+
+```bash
+ssh-keygen -F aiyun2
+ssh-keygen -R aiyun2
+ssh root@aiyun2
+bin/trojan-node host check --node aiyun2
+```
+
+若 SSH alias 实际通过 `HostKeyAlias` 记录，`ssh-keygen -R` 的参数必须用同一个 alias。
+重新连接时人工确认的指纹应与控制台一致。
 
 ## CLI
 
