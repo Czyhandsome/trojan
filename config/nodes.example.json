@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "profile": "personal",
+  "zone": "example.com",
+  "managerCredential": {
+    "name": "cloudflare-example",
+    "field": "token-manager"
+  },
+  "nodes": {
+    "example-node": {
+      "address": "203.0.113.30",
+      "domain": "trojan.example.com",
+      "sshUser": "root",
+      "sshPort": 2222,
+      "sshTarget": "example-node",
+      "sshHostKey": {
+        "algorithm": "ssh-ed25519",
+        "knownHostsAlias": "example-node"
+      },
+      "credential": "trojan-example-node",
+      "cloudflareTokenName": "trojan-example-node-dns01",
+      "sourceCidr": "203.0.113.30/32"
+    }
+  }
+}

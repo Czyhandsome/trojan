@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Local, fail-closed orchestrator for the two Czyhandsome Xray nodes."""
+"""Local, fail-closed orchestrator for Czyhandsome Xray nodes."""
 
 from __future__ import annotations
 
 import argparse
 import base64
 import hashlib
+import ipaddress
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from typing import Any, NamedTuple
 import urllib.error
@@ -30,7 +32,9 @@ from datetime import datetime, timezone
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "config" / "nodes.json"
-NODE_NAMES = ("aiyun", "aiyun2")
+LOCAL_MANIFEST = pathlib.Path.home() / ".config" / "trojan-node" / "nodes.json"
+NODE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
+SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._:\[\]-]+\Z")
 CREDS_CONTEXT_ENV = "TROJAN_NODE_CREDS_CONTEXT"
 PROVENANCE_DIR = "/var/lib/trojan-node"
 PROVENANCE_FILE = PROVENANCE_DIR + "/provenance.json"
@@ -41,17 +45,96 @@ class SafetyError(Exception):
     """An explicit safety precondition was not satisfied."""
 
 
+class ProgressReporter:
+    def __init__(self, *, total: int = 9, stream: Any | None = None):
+        self.total = total
+        self.stream = sys.stderr if stream is None else stream
+
+    def emit(self, step: int, label: str, state: str, **details: Any) -> None:
+        suffix = " ".join(
+            f"{key}={str(value).lower() if isinstance(value, bool) else value}"
+            for key, value in details.items()
+            if value is not None
+        )
+        message = f"[{step}/{self.total}] {label:<14} {state}"
+        if suffix:
+            message += " " + suffix
+        print(message, file=self.stream, flush=True)
+
+
+def run_with_heartbeat(
+    reporter: ProgressReporter,
+    step: int,
+    label: str,
+    action: Any,
+    *,
+    interval_seconds: float = 30.0,
+    detail_factory: Any | None = None,
+) -> Any:
+    """Run one opaque action while reporting only elapsed time."""
+    stopped = threading.Event()
+    started = time.monotonic()
+
+    def pulse() -> None:
+        while not stopped.wait(interval_seconds):
+            elapsed = time.monotonic() - started
+            details = (
+                detail_factory(elapsed)
+                if detail_factory is not None
+                else {"elapsed": f"{int(elapsed)}s"}
+            )
+            reporter.emit(
+                step,
+                label,
+                "running",
+                **details,
+            )
+
+    thread = threading.Thread(target=pulse, daemon=True)
+    thread.start()
+    try:
+        return action()
+    finally:
+        stopped.set()
+        thread.join()
+
+
+def report_deploy_failure(
+    node: "Node", stage: str, effects: dict[str, bool], *, stream: Any | None = None
+) -> None:
+    target = sys.stderr if stream is None else stream
+    fields = [
+        f"stage={stage}",
+        f"dnsApplied={str(effects['dnsApplied']).lower()}",
+        f"credentialsRotated={str(effects['credentialsRotated']).lower()}",
+        f"serverInstalled={str(effects['serverInstalled']).lower()}",
+        f"provenanceWritten={str(effects['provenanceWritten']).lower()}",
+        f"clientVerified={str(effects['clientVerified']).lower()}",
+    ]
+    if effects["provenanceWritten"] and not effects["clientVerified"]:
+        fields.append(f"safeResume=trojan-node verify --node {node.name}")
+    elif effects["serverInstalled"]:
+        fields.append(f"safeResume=trojan-node preflight --node {node.name}")
+    elif effects["credentialsRotated"] or effects["dnsApplied"]:
+        fields.append(f"safeResume=trojan-node deploy --node {node.name} --apply")
+    else:
+        fields.append(f"safeResume=trojan-node preflight --node {node.name}")
+    print("FAILED " + " ".join(fields), file=target, flush=True)
+
+
 class Node(NamedTuple):
     name: str
     address: str
     domain: str
     ssh_user: str
     ssh_port: int
+    ssh_target: str
     ssh_algorithm: str
     ssh_host_alias: str
     credential: str
     cloudflare_token_name: str
     source_cidr: str
+    zone: str
 
 
 class Manifest(NamedTuple):
@@ -81,23 +164,40 @@ def _required_string(obj: dict[str, Any], key: str, context: str) -> str:
     return value
 
 
-def load_manifest(path: pathlib.Path = DEFAULT_MANIFEST) -> Manifest:
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SafetyError(f"cannot load node manifest: {exc}") from None
+def resolve_manifest_path(
+    *,
+    local_path: pathlib.Path = LOCAL_MANIFEST,
+    bundled_path: pathlib.Path = DEFAULT_MANIFEST,
+) -> pathlib.Path:
+    if local_path.is_symlink():
+        raise SafetyError("local node inventory must not be a symlink")
+    if local_path.exists():
+        if not local_path.is_file():
+            raise SafetyError("local node inventory must be a regular file")
+        if (local_path.stat().st_mode & 0o777) != 0o600:
+            raise SafetyError("local node inventory permissions must be 0600")
+        return local_path
+    return bundled_path
+
+
+def parse_manifest(raw: Any) -> Manifest:
+    if not isinstance(raw, dict):
+        raise SafetyError("node manifest must be an object")
     if raw.get("schemaVersion") != 1:
         raise SafetyError("unsupported node manifest schemaVersion")
     raw_nodes = raw.get("nodes")
-    if not isinstance(raw_nodes, dict) or set(raw_nodes) != set(NODE_NAMES):
-        raise SafetyError("node manifest must contain exactly aiyun and aiyun2")
+    if not isinstance(raw_nodes, dict) or not raw_nodes:
+        raise SafetyError("node manifest must contain at least one node")
+    if any(not isinstance(name, str) or not NODE_NAME_RE.fullmatch(name) for name in raw_nodes):
+        raise SafetyError("node manifest contains an invalid node name")
     manager = raw.get("managerCredential")
     if not isinstance(manager, dict):
         raise SafetyError("managerCredential must be an object")
 
+    profile = _required_string(raw, "profile", "manifest")
+    default_zone = _required_string(raw, "zone", "manifest")
     nodes: dict[str, Node] = {}
-    for name in NODE_NAMES:
-        item = raw_nodes[name]
+    for name, item in raw_nodes.items():
         if not isinstance(item, dict):
             raise SafetyError(f"nodes.{name} must be an object")
         host_key = item.get("sshHostKey")
@@ -106,29 +206,280 @@ def load_manifest(path: pathlib.Path = DEFAULT_MANIFEST) -> Manifest:
         port = item.get("sshPort")
         if not isinstance(port, int) or not 1 <= port <= 65535:
             raise SafetyError(f"nodes.{name}.sshPort is invalid")
+        ssh_host_alias = _required_string(
+            host_key, "knownHostsAlias", f"nodes.{name}.sshHostKey"
+        )
+        ssh_algorithm = _required_string(
+            host_key, "algorithm", f"nodes.{name}.sshHostKey"
+        )
+        if ssh_algorithm != "ssh-ed25519":
+            raise SafetyError(f"nodes.{name}.sshHostKey.algorithm must be ssh-ed25519")
+        ssh_target = item.get("sshTarget", ssh_host_alias)
+        if (
+            not isinstance(ssh_target, str)
+            or not SSH_TARGET_RE.fullmatch(ssh_target)
+            or ssh_target.startswith("-")
+        ):
+            raise SafetyError(f"nodes.{name}.sshTarget is invalid")
+        address = _required_string(item, "address", f"nodes.{name}")
+        try:
+            ipaddress.IPv4Address(address)
+        except ipaddress.AddressValueError:
+            raise SafetyError(f"nodes.{name}.address must be IPv4") from None
+        zone = (
+            _required_string(item, "zone", f"nodes.{name}")
+            if "zone" in item else default_zone
+        )
+        domain = _required_string(item, "domain", f"nodes.{name}")
+        if domain != zone and not domain.endswith("." + zone):
+            raise SafetyError(f"nodes.{name}.domain must belong to its zone")
+        credential = _required_string(item, "credential", f"nodes.{name}")
+        token_name = _required_string(
+            item, "cloudflareTokenName", f"nodes.{name}"
+        )
+        source_cidr = _required_string(item, "sourceCidr", f"nodes.{name}")
+        if credential != f"trojan-{name}":
+            raise SafetyError(f"nodes.{name}.credential is not derived from node ID")
+        if token_name != f"trojan-{name}-dns01":
+            raise SafetyError(
+                f"nodes.{name}.cloudflareTokenName is not derived from node ID"
+            )
+        if source_cidr != f"{address}/32":
+            raise SafetyError(f"nodes.{name}.sourceCidr must match address /32")
         nodes[name] = Node(
             name=name,
-            address=_required_string(item, "address", f"nodes.{name}"),
-            domain=_required_string(item, "domain", f"nodes.{name}"),
+            address=address,
+            domain=domain,
             ssh_user=_required_string(item, "sshUser", f"nodes.{name}"),
             ssh_port=port,
-            ssh_algorithm=_required_string(host_key, "algorithm", f"nodes.{name}.sshHostKey"),
-            ssh_host_alias=_required_string(
-                host_key, "knownHostsAlias", f"nodes.{name}.sshHostKey"
-            ),
-            credential=_required_string(item, "credential", f"nodes.{name}"),
-            cloudflare_token_name=_required_string(
-                item, "cloudflareTokenName", f"nodes.{name}"
-            ),
-            source_cidr=_required_string(item, "sourceCidr", f"nodes.{name}"),
+            ssh_target=ssh_target,
+            ssh_algorithm=ssh_algorithm,
+            ssh_host_alias=ssh_host_alias,
+            credential=credential,
+            cloudflare_token_name=token_name,
+            source_cidr=source_cidr,
+            zone=zone,
         )
+    unique_fields = {
+        "domain": lambda node: node.domain,
+        "address": lambda node: node.address,
+        "credential": lambda node: node.credential,
+        "Cloudflare token name": lambda node: node.cloudflare_token_name,
+        "source CIDR": lambda node: node.source_cidr,
+    }
+    for label, project in unique_fields.items():
+        values = [project(node) for node in nodes.values()]
+        if len(values) != len(set(values)):
+            raise SafetyError(f"node {label} values must be unique")
     return Manifest(
-        profile=_required_string(raw, "profile", "manifest"),
-        zone=_required_string(raw, "zone", "manifest"),
+        profile=profile,
+        zone=default_zone,
         manager_credential=_required_string(manager, "name", "managerCredential"),
         manager_field=_required_string(manager, "field", "managerCredential"),
         nodes=nodes,
     )
+
+
+def load_manifest(
+    path: pathlib.Path | None = None,
+    *,
+    local_path: pathlib.Path = LOCAL_MANIFEST,
+    bundled_path: pathlib.Path = DEFAULT_MANIFEST,
+) -> Manifest:
+    selected = path or resolve_manifest_path(
+        local_path=local_path, bundled_path=bundled_path
+    )
+    try:
+        raw = json.loads(selected.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError(f"cannot load node manifest: {exc}") from None
+    return parse_manifest(raw)
+
+
+def node_to_raw(node: Node, default_zone: str) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "address": node.address,
+        "domain": node.domain,
+        "sshUser": node.ssh_user,
+        "sshPort": node.ssh_port,
+        "sshTarget": node.ssh_target,
+        "sshHostKey": {
+            "algorithm": node.ssh_algorithm,
+            "knownHostsAlias": node.ssh_host_alias,
+        },
+        "credential": node.credential,
+        "cloudflareTokenName": node.cloudflare_token_name,
+        "sourceCidr": node.source_cidr,
+    }
+    if node.zone != default_zone:
+        result["zone"] = node.zone
+    return result
+
+
+def manifest_to_raw(manifest: Manifest) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "profile": manifest.profile,
+        "zone": manifest.zone,
+        "managerCredential": {
+            "name": manifest.manager_credential,
+            "field": manifest.manager_field,
+        },
+        "nodes": {
+            name: node_to_raw(node, manifest.zone)
+            for name, node in manifest.nodes.items()
+        },
+    }
+
+
+def resolve_ssh_target(
+    target: str,
+    *,
+    public_ip: str | None = None,
+    runner: Any = subprocess.run,
+) -> dict[str, Any]:
+    if not SSH_TARGET_RE.fullmatch(target) or target.startswith("-"):
+        raise SafetyError("ssh target must be one OpenSSH destination without options")
+    completed = runner(
+        ["ssh", "-G", target], text=True, capture_output=True, check=False
+    )
+    if completed.returncode != 0:
+        raise SafetyError("ssh target resolution failed")
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key not in values:
+            values[key.lower()] = value.strip()
+    try:
+        hostname = values["hostname"]
+        user = values["user"]
+        port = int(values["port"])
+    except (KeyError, ValueError):
+        raise SafetyError("ssh target resolution was incomplete") from None
+    address_text = public_ip or hostname
+    try:
+        address = ipaddress.IPv4Address(address_text)
+    except ipaddress.AddressValueError:
+        raise SafetyError("ssh target requires an explicit public IPv4 address") from None
+    if not address.is_global:
+        raise SafetyError("ssh target IPv4 address must be public")
+    if not 1 <= port <= 65535:
+        raise SafetyError("ssh target port is invalid")
+    target_host = target.rsplit("@", 1)[-1]
+    host_alias = values.get("hostkeyalias")
+    if not host_alias or host_alias.lower() == "none":
+        host_alias = f"[{target_host}]:{port}" if port != 22 else target_host
+    return {
+        "address": str(address),
+        "effectiveHostname": hostname,
+        "user": user,
+        "port": port,
+        "hostAlias": host_alias,
+    }
+
+
+def validate_registered_ssh_target(
+    node: Node, *, runner: Any = subprocess.run
+) -> None:
+    resolved = resolve_ssh_target(
+        node.ssh_target, public_ip=node.address, runner=runner
+    )
+    expected = (node.ssh_user, node.ssh_port, node.ssh_host_alias)
+    actual = (resolved["user"], resolved["port"], resolved["hostAlias"])
+    if actual != expected:
+        raise SafetyError(f"{node.name}: registered SSH user, port, or alias changed")
+    try:
+        effective_address = ipaddress.IPv4Address(resolved["effectiveHostname"])
+    except ipaddress.AddressValueError:
+        return
+    if str(effective_address) != node.address:
+        raise SafetyError(f"{node.name}: registered SSH effective address changed")
+
+
+def write_local_manifest(raw: dict[str, Any], path: pathlib.Path = LOCAL_MANIFEST) -> None:
+    if path.exists() and (path.is_symlink() or not path.is_file()):
+        raise SafetyError("local node inventory must be a regular file")
+    if path.parent.is_symlink():
+        raise SafetyError("local node inventory directory must not be a symlink")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temporary: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=".nodes.", delete=False
+        ) as handle:
+            json.dump(raw, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            temporary = pathlib.Path(handle.name)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def register_node(
+    args: argparse.Namespace,
+    *,
+    reader: Any = input,
+    runner: Any = subprocess.run,
+    local_path: pathlib.Path = LOCAL_MANIFEST,
+    bundled_path: pathlib.Path = DEFAULT_MANIFEST,
+) -> Node:
+    manifest = load_manifest(local_path=local_path, bundled_path=bundled_path)
+    name = args.node_name
+    if not NODE_NAME_RE.fullmatch(name):
+        raise SafetyError("node name must use lowercase letters, digits, and hyphens")
+    if name in manifest.nodes:
+        raise SafetyError(f"node already exists: {name}")
+    domain = args.domain.strip().lower()
+    zone = (args.zone or manifest.zone).strip().lower()
+    if not domain or not zone or not (domain == zone or domain.endswith("." + zone)):
+        raise SafetyError("node domain must belong to its Cloudflare zone")
+    resolved = resolve_ssh_target(
+        args.ssh_target, public_ip=args.public_ip, runner=runner
+    )
+    node = Node(
+        name=name,
+        address=resolved["address"],
+        domain=domain,
+        ssh_user=resolved["user"],
+        ssh_port=resolved["port"],
+        ssh_target=args.ssh_target,
+        ssh_algorithm="ssh-ed25519",
+        ssh_host_alias=resolved["hostAlias"],
+        credential=f"trojan-{name}",
+        cloudflare_token_name=f"trojan-{name}-dns01",
+        source_cidr=f"{resolved['address']}/32",
+        zone=zone,
+    )
+    for existing in manifest.nodes.values():
+        if node.domain == existing.domain or node.address == existing.address:
+            raise SafetyError("node domain and address must be unique")
+        if node.credential == existing.credential:
+            raise SafetyError("node credential name must be unique")
+        if node.cloudflare_token_name == existing.cloudflare_token_name:
+            raise SafetyError("node Cloudflare token name must be unique")
+    load_trusted_known_host(node, runner=runner)
+    run_verified_ssh(node, ["true"], runner=runner)
+    print(json.dumps({
+        "schemaVersion": 1,
+        "action": "add-node",
+        "node": name,
+        "sshTarget": node.ssh_target,
+        "address": node.address,
+        "domain": node.domain,
+        "zone": node.zone,
+    }, sort_keys=True), file=sys.stderr, flush=True)
+    if not confirm_node(node, reader=reader):
+        raise SafetyError(f"{name}: confirmation did not match")
+    raw = manifest_to_raw(manifest)
+    raw["nodes"][name] = node_to_raw(node, manifest.zone)
+    parse_manifest(raw)
+    write_local_manifest(raw, local_path)
+    return node
 
 
 def fingerprint_known_host(key_line: str, node: Node) -> str:
@@ -205,7 +556,7 @@ def run_verified_ssh(
             "-o", f"HostKeyAlias={node.ssh_host_alias}",
             "-o", "HostKeyAlgorithms=ssh-ed25519",
             "-o", "ConnectTimeout=15",
-            f"{node.ssh_user}@{node.address}",
+            node.ssh_target,
             "--",
             shlex.join(remote_argv),
         ]
@@ -292,17 +643,18 @@ def store_credential_field(
         raise SafetyError(f"{node.name}: failed to store {field} in creds")
 
 
-def credential_context_files(args: argparse.Namespace) -> list[pathlib.Path]:
-    manager = ROOT / "config" / "credentials-manager.json"
+def credential_context_requirements(args: argparse.Namespace) -> tuple[bool, bool]:
+    if args.command == "node":
+        return False, False
     if args.command == "credentials":
-        return [] if args.credentials_command == "status" else [manager]
+        return (False, False) if args.credentials_command == "status" else (True, False)
     if args.command == "host":
-        return []
+        return False, False
     if args.command == "verify":
-        return [ROOT / "config" / f"credentials-{args.node}.json"]
+        return False, True
     if args.command == "deploy" and args.apply and not args.rotate_secrets:
-        return [manager, ROOT / "config" / f"credentials-{args.node}.json"]
-    return [manager]
+        return True, True
+    return True, False
 
 
 def run_in_credential_context(
@@ -313,23 +665,42 @@ def run_in_credential_context(
     runner: Any = subprocess.run,
     environ: dict[str, str] | None = None,
 ) -> int:
-    configs = credential_context_files(args)
-    if not configs:
+    require_manager, require_node = credential_context_requirements(args)
+    if not require_manager and not require_node:
         raise SafetyError("this command does not require a credential context")
-    for path in configs:
-        if not path.is_file():
-            raise SafetyError(f"credential placeholder config is missing: {path.name}")
-    argv = ["creds", "exec"]
-    for path in configs:
-        argv.extend(["--from", str(path)])
-    argv.extend([
-        "--profile", manifest.profile,
-        "--", sys.executable, str(pathlib.Path(__file__).resolve()), *raw_argv,
-    ])
-    child_env = dict(os.environ if environ is None else environ)
-    child_env[CREDS_CONTEXT_ENV] = "1"
-    completed = runner(argv, env=child_env, check=False)
-    return completed.returncode
+    manager_path = ROOT / "config" / "credentials-manager.json"
+    if require_manager and not manager_path.is_file():
+        raise SafetyError("credential placeholder config is missing: credentials-manager.json")
+    node_name = getattr(args, "node", "")
+    node = manifest.nodes.get(node_name)
+    if require_node and node is None:
+        available = ", ".join(sorted(manifest.nodes))
+        raise SafetyError(f"unknown node {node_name}; available nodes: {available}")
+    with tempfile.TemporaryDirectory(prefix="trojan-node-creds-") as temp_dir:
+        configs: list[pathlib.Path] = []
+        if require_manager:
+            configs.append(manager_path)
+        if require_node and node is not None:
+            node_path = pathlib.Path(temp_dir) / "node.json"
+            node_path.write_text(json.dumps({
+                "password": f"<<secret:generic/{node.credential}/password>>",
+                "cloudflareToken": (
+                    f"<<secret:generic/{node.credential}/cloudflare-token>>"
+                ),
+            }, sort_keys=True) + "\n", encoding="utf-8")
+            os.chmod(node_path, 0o600)
+            configs.append(node_path)
+        argv = ["creds", "exec"]
+        for path in configs:
+            argv.extend(["--from", str(path)])
+        argv.extend([
+            "--profile", manifest.profile,
+            "--", sys.executable, str(pathlib.Path(__file__).resolve()), *raw_argv,
+        ])
+        child_env = dict(os.environ if environ is None else environ)
+        child_env[CREDS_CONTEXT_ENV] = "1"
+        completed = runner(argv, env=child_env, check=False)
+        return completed.returncode
 
 
 def credential_env_key(name: str, field: str) -> str:
@@ -1069,6 +1440,7 @@ def run_remote_preflight(
     *,
     ssh_runner: Any = run_verified_ssh,
 ) -> dict[str, str]:
+    validate_registered_ssh_target(node)
     output = ssh_runner(node, ["sh", "-c", REMOTE_PREFLIGHT_SCRIPT])
     return validate_remote_preflight(output, node)
 
@@ -1251,6 +1623,35 @@ def gcp_ssh_argv(port: int, *, keepalive_seconds: int | None) -> list[str]:
     return argv
 
 
+def run_gcp_reconnects(
+    node: Node,
+    port: int,
+    *,
+    reconnects: int,
+    reporter: ProgressReporter | None = None,
+    progress_step: int = 9,
+) -> None:
+    for attempt in range(1, reconnects + 1):
+        completed = subprocess.run(
+            gcp_ssh_argv(port, keepalive_seconds=None),
+            text=True,
+            capture_output=True,
+            check=False,
+            env=_subprocess_env_without_credentials(),
+        )
+        if completed.returncode != 0:
+            raise SafetyError(
+                f"{node.name}: GCP SSH reconnect {attempt}/{reconnects} failed"
+            )
+        if reporter is not None:
+            reporter.emit(
+                progress_step,
+                "client-verify",
+                "running",
+                reconnect=f"{attempt}/{reconnects}",
+            )
+
+
 def _subprocess_env_without_credentials() -> dict[str, str]:
     return {
         key: value for key, value in os.environ.items()
@@ -1272,12 +1673,98 @@ def validate_mihomo_version(output: str) -> tuple[int, int, int]:
     return version
 
 
+def validate_local_acceptance_prerequisites(
+    *, runner: Any = subprocess.run,
+    known_hosts_path: pathlib.Path | None = None,
+) -> None:
+    mihomo = shutil.which("mihomo")
+    if not mihomo:
+        raise SafetyError("Mihomo v1.19.29 or newer is required for acceptance")
+    version = runner(
+        [mihomo, "-v"], text=True, capture_output=True, check=False,
+        env=_subprocess_env_without_credentials(),
+    )
+    if version.returncode != 0:
+        raise SafetyError("Mihomo version check failed")
+    validate_mihomo_version(version.stdout + version.stderr)
+
+    source = (
+        pathlib.Path.home() / ".ssh" / "known_hosts"
+        if known_hosts_path is None else known_hosts_path
+    )
+    lookup = runner(
+        ["ssh-keygen", "-F", "[34.31.209.55]:50245", "-f", str(source)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    keys = [
+        line for line in lookup.stdout.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+        and " ssh-ed25519 " in line
+    ]
+    if lookup.returncode != 0 or not keys:
+        raise SafetyError("GCP SSH ED25519 known-host entry is unavailable")
+
+
+def allocate_acceptance_port() -> int:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+    finally:
+        probe.close()
+
+
+def start_isolated_mihomo(
+    mihomo: str,
+    temp_dir: str,
+    node: Node,
+    password: str,
+    *,
+    attempts: int = 3,
+) -> tuple[subprocess.Popen[bytes], int]:
+    config_path = pathlib.Path(temp_dir) / "config.yaml"
+    for _attempt in range(1, attempts + 1):
+        port = allocate_acceptance_port()
+        config_path.write_text(
+            render_mihomo_config(node, password, port), encoding="utf-8"
+        )
+        os.chmod(config_path, 0o600)
+        process = subprocess.Popen(
+            [mihomo, "-d", temp_dir, "-f", str(config_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_subprocess_env_without_credentials(),
+        )
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                    return process, port
+            except OSError:
+                time.sleep(0.2)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    raise SafetyError(f"{node.name}: isolated Mihomo failed to claim a local port")
+
+
 def run_mihomo_acceptance(
     node: Node,
     password: str,
     *,
     reconnects: int = 20,
     soak_seconds: int = 3600,
+    reporter: ProgressReporter | None = None,
+    progress_step: int = 9,
 ) -> None:
     mihomo = shutil.which("mihomo")
     if not mihomo:
@@ -1289,40 +1776,12 @@ def run_mihomo_acceptance(
     if version.returncode != 0:
         raise SafetyError("Mihomo version check failed")
     validate_mihomo_version(version.stdout + version.stderr)
-    port = 17890
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        probe.bind(("127.0.0.1", port))
-    except OSError:
-        raise SafetyError("isolated Mihomo port 127.0.0.1:17890 is occupied") from None
-    finally:
-        probe.close()
-
     process: subprocess.Popen[bytes] | None = None
     with tempfile.TemporaryDirectory(prefix="trojan-node-mihomo-") as temp_dir:
-        config_path = pathlib.Path(temp_dir) / "config.yaml"
-        config_path.write_text(render_mihomo_config(node, password, port), encoding="utf-8")
-        os.chmod(config_path, 0o600)
         try:
-            process = subprocess.Popen(
-                [mihomo, "-d", temp_dir, "-f", str(config_path)],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_subprocess_env_without_credentials(),
+            process, port = start_isolated_mihomo(
+                mihomo, temp_dir, node, password
             )
-            deadline = time.monotonic() + 20
-            while time.monotonic() < deadline:
-                if process.poll() is not None:
-                    raise SafetyError(f"{node.name}: isolated Mihomo exited during startup")
-                try:
-                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
-                        break
-                except OSError:
-                    time.sleep(0.2)
-            else:
-                raise SafetyError(f"{node.name}: isolated Mihomo did not become ready")
-
             proxy_url = f"http://127.0.0.1:{port}"
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
@@ -1335,26 +1794,33 @@ def run_mihomo_acceptance(
             if exit_ip != node.address:
                 raise SafetyError(f"{node.name}: proxy exit IP does not match node")
 
-            for attempt in range(1, reconnects + 1):
-                completed = subprocess.run(
-                    gcp_ssh_argv(port, keepalive_seconds=None),
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    env=_subprocess_env_without_credentials(),
-                )
-                if completed.returncode != 0:
-                    raise SafetyError(
-                        f"{node.name}: GCP SSH reconnect {attempt}/{reconnects} failed"
-                    )
+            run_gcp_reconnects(
+                node,
+                port,
+                reconnects=reconnects,
+                reporter=reporter,
+                progress_step=progress_step,
+            )
             try:
-                soak = subprocess.run(
-                    gcp_ssh_argv(port, keepalive_seconds=soak_seconds),
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=soak_seconds + 120,
-                    env=_subprocess_env_without_credentials(),
+                soak = run_with_heartbeat(
+                    reporter or ProgressReporter(),
+                    progress_step,
+                    "client-verify",
+                    lambda: subprocess.run(
+                        gcp_ssh_argv(port, keepalive_seconds=soak_seconds),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=soak_seconds + 120,
+                        env=_subprocess_env_without_credentials(),
+                    ),
+                    interval_seconds=60.0,
+                    detail_factory=lambda elapsed: {
+                        "elapsed": f"{int(elapsed // 60)}m",
+                        "remaining": (
+                            f"{max(0, int((soak_seconds - elapsed + 59) // 60))}m"
+                        ),
+                    },
                 )
             except subprocess.TimeoutExpired:
                 raise SafetyError(f"{node.name}: GCP SSH keepalive timed out") from None
@@ -1416,7 +1882,47 @@ def execute_command(
     *,
     reader: Any = input,
 ) -> int:
-    node = manifest.nodes[getattr(args, "node", "aiyun")]
+    if args.command == "node":
+        if args.node_command == "list":
+            print(json.dumps({
+                "schemaVersion": 1,
+                "nodes": sorted(manifest.nodes),
+            }, sort_keys=True))
+            return 0
+        if args.node_command == "show":
+            node = manifest.nodes.get(args.node_name)
+            if node is None:
+                available = ", ".join(sorted(manifest.nodes))
+                raise SafetyError(
+                    f"unknown node {args.node_name}; available nodes: {available}"
+                )
+            print(json.dumps({
+                "schemaVersion": 1,
+                "node": node.name,
+                "address": node.address,
+                "domain": node.domain,
+                "sshTarget": node.ssh_target,
+                "sshUser": node.ssh_user,
+                "sshPort": node.ssh_port,
+                "zone": node.zone,
+                "credential": node.credential,
+                "cloudflareTokenName": node.cloudflare_token_name,
+                "sourceCidr": node.source_cidr,
+            }, sort_keys=True))
+            return 0
+        node = register_node(args, reader=reader)
+        print(json.dumps({
+            "schemaVersion": 1,
+            "node": node.name,
+            "registered": True,
+        }, sort_keys=True))
+        return 0
+
+    node_name = getattr(args, "node", "")
+    node = manifest.nodes.get(node_name)
+    if node is None:
+        available = ", ".join(sorted(manifest.nodes))
+        raise SafetyError(f"unknown node {node_name}; available nodes: {available}")
 
     if args.command == "credentials" and args.credentials_command == "status":
         print(json.dumps({
@@ -1427,6 +1933,7 @@ def execute_command(
         return 0
 
     if args.command == "host":
+        validate_registered_ssh_target(node)
         fingerprint = fingerprint_known_host(load_trusted_known_host(node), node)
         run_verified_ssh(node, ["true"])
         print(json.dumps({
@@ -1435,11 +1942,19 @@ def execute_command(
         return 0
 
     if args.command == "verify":
+        progress = ProgressReporter(total=2)
         if not bundle.password:
             raise SafetyError(f"{node.name}: Trojan password is unavailable")
+        validate_registered_ssh_target(node)
+        progress.emit(1, "server-verify", "start")
         snapshot = server_snapshot(node)
         verify_online_tls(node, expected_sha256=snapshot["CERT_SHA256"])
-        run_mihomo_acceptance(node, bundle.password)
+        progress.emit(1, "server-verify", "ok", pid=snapshot["PID"], tls="ok")
+        progress.emit(2, "client-verify", "start")
+        run_mihomo_acceptance(
+            node, bundle.password, reporter=progress, progress_step=2
+        )
+        progress.emit(2, "client-verify", "ok")
         print(json.dumps({
             "node": node.name,
             "verified": True,
@@ -1455,7 +1970,7 @@ def execute_command(
     if args.command == "credentials":
         if not confirm_node(node, reader=reader):
             raise SafetyError(f"{node.name}: confirmation did not match")
-        zone = resolve_unique_zone(client, manifest.zone)
+        zone = resolve_unique_zone(client, node.zone)
         rotate_node_credentials(client, manifest, node, zone["id"])
         print(json.dumps({"node": node.name, "credentials": "rotated"}, sort_keys=True))
         return 0
@@ -1469,7 +1984,7 @@ def execute_command(
         return 0
 
     if args.command == "cloudflare" and args.cloudflare_command == "dns":
-        zone = resolve_unique_zone(client, manifest.zone)
+        zone = resolve_unique_zone(client, node.zone)
         records = list_node_dns_records(client, zone["id"], node.domain)
         if args.dns_command == "list":
             print(json.dumps({"node": node.name, "records": records}, sort_keys=True))
@@ -1498,7 +2013,7 @@ def execute_command(
             revoked = revoke_named_node_tokens(client, node)
             print(json.dumps({"node": node.name, "revoked": revoked}, sort_keys=True))
             return 0
-        zone = resolve_unique_zone(client, manifest.zone)
+        zone = resolve_unique_zone(client, node.zone)
         rotate_dns_token(
             client, manifest, node, zone["id"], _permission_groups(client)
         )
@@ -1506,14 +2021,24 @@ def execute_command(
         return 0
 
     if args.command == "preflight":
-        zone = resolve_unique_zone(client, manifest.zone)
+        progress = ProgressReporter(total=4)
+        progress.emit(1, "manifest", "ok", node=node.name)
+        progress.emit(2, "cloudflare", "start")
+        zone = resolve_unique_zone(client, node.zone)
         records = list_node_dns_records(client, zone["id"], node.domain)
         dns_plan = plan_dns_change(records, node)
         if dns_plan["action"] != "noop":
             raise SafetyError(f"{node.name}: DNS is not ready ({dns_plan['action']})")
+        progress.emit(2, "cloudflare", "ok", dns_action="noop")
+        progress.emit(3, "staging", "start")
         artifact = build_source_archive()
-        remote = run_remote_preflight(node)
+        progress.emit(3, "staging", "ok", commit=artifact.commit)
+        progress.emit(4, "ssh-preflight", "start")
+        remote = run_with_heartbeat(
+            progress, 4, "ssh-preflight", lambda: run_remote_preflight(node)
+        )
         validate_deployable_remote(node, artifact, remote)
+        progress.emit(4, "ssh-preflight", "ok", remote_state=remote.get("STATE"))
         print(json.dumps({
             "node": node.name,
             "gitCommit": artifact.commit,
@@ -1524,15 +2049,28 @@ def execute_command(
         return 0
 
     if args.command == "deploy":
+        progress = ProgressReporter()
+        progress.emit(1, "manifest", "ok", node=node.name)
         if not args.rotate_secrets and credentials_status(manifest, node) != {
             "password": "PRESENT", "cloudflare-token": "PRESENT"
         }:
             raise SafetyError(f"{node.name}: existing node credentials are incomplete")
-        zone = resolve_unique_zone(client, manifest.zone)
+        progress.emit(2, "cloudflare", "start")
+        zone = resolve_unique_zone(client, node.zone)
         records = list_node_dns_records(client, zone["id"], node.domain)
         dns_plan = plan_dns_change(records, node)
+        progress.emit(2, "cloudflare", "ok", dns_action=dns_plan["action"])
+        progress.emit(3, "staging", "start")
         artifact = build_source_archive()
-        remote = run_remote_preflight(node)
+        progress.emit(
+            3, "staging", "ok", commit=artifact.commit,
+            archive_sha256=artifact.sha256,
+        )
+        progress.emit(4, "ssh-preflight", "start")
+        remote = run_with_heartbeat(
+            progress, 4, "ssh-preflight", lambda: run_remote_preflight(node)
+        )
+        progress.emit(4, "ssh-preflight", "ok", remote_state=remote.get("STATE"))
         require_rerun_secret_policy(
             remote, rotate_secrets=args.rotate_secrets, node=node
         )
@@ -1543,32 +2081,82 @@ def execute_command(
         print(json.dumps(plan, sort_keys=True))
         if not args.apply:
             return 0
+        validate_local_acceptance_prerequisites()
         if not confirm_node(node, reader=reader):
             raise SafetyError(f"{node.name}: confirmation did not match")
-        apply_dns_change_with_readback(client, zone["id"], node, dns_plan)
-        if args.rotate_secrets:
-            node_bundle = rotate_node_credentials(client, manifest, node, zone["id"])
-        else:
-            if not bundle.password or not bundle.node_token:
-                raise SafetyError(f"{node.name}: existing node credentials are unavailable")
-            node_bundle = bundle
-        password = node_bundle.password
-        node_token = node_bundle.node_token
-        if not password or not node_token:
-            raise SafetyError(f"{node.name}: node credential rotation was incomplete")
-        stage_and_install(
-            node, artifact, password, node_token
-        )
-        before = server_snapshot(node)
-        stage_and_install(
-            node, artifact, password, node_token
-        )
-        after = server_snapshot(node)
-        if not same_install_identity(before, after):
-            raise SafetyError(f"{node.name}: repeated install changed managed identity")
-        verify_online_tls(node, expected_sha256=after["CERT_SHA256"])
-        write_managed_provenance(node, artifact)
-        run_mihomo_acceptance(node, password)
+        effects = {
+            "dnsApplied": False,
+            "credentialsRotated": False,
+            "serverInstalled": False,
+            "provenanceWritten": False,
+            "clientVerified": False,
+        }
+        stage = "dns-apply"
+        try:
+            apply_dns_change_with_readback(client, zone["id"], node, dns_plan)
+            effects["dnsApplied"] = dns_plan["action"] != "noop"
+            progress.emit(5, "credentials", "start")
+            if args.rotate_secrets:
+                stage = "credential-rotation"
+                node_bundle = rotate_node_credentials(
+                    client, manifest, node, zone["id"]
+                )
+                effects["credentialsRotated"] = True
+            else:
+                if not bundle.password or not bundle.node_token:
+                    raise SafetyError(
+                        f"{node.name}: existing node credentials are unavailable"
+                    )
+                node_bundle = bundle
+            progress.emit(
+                5, "credentials", "ok",
+                rotated=effects["credentialsRotated"],
+            )
+            password = node_bundle.password
+            node_token = node_bundle.node_token
+            if not password or not node_token:
+                raise SafetyError(f"{node.name}: node credential rotation was incomplete")
+            stage = "install-1"
+            progress.emit(6, "install-1", "start")
+            run_with_heartbeat(
+                progress,
+                6,
+                "install-1",
+                lambda: stage_and_install(node, artifact, password, node_token),
+            )
+            effects["serverInstalled"] = True
+            progress.emit(6, "install-1", "ok")
+            before = run_with_heartbeat(
+                progress, 6, "install-1", lambda: server_snapshot(node)
+            )
+            stage = "install-2"
+            progress.emit(7, "install-2", "start")
+            run_with_heartbeat(
+                progress,
+                7,
+                "install-2",
+                lambda: stage_and_install(node, artifact, password, node_token),
+            )
+            progress.emit(7, "install-2", "ok")
+            progress.emit(8, "server-verify", "start")
+            after = run_with_heartbeat(
+                progress, 8, "server-verify", lambda: server_snapshot(node)
+            )
+            if not same_install_identity(before, after):
+                raise SafetyError(f"{node.name}: repeated install changed managed identity")
+            stage = "server-verification"
+            verify_online_tls(node, expected_sha256=after["CERT_SHA256"])
+            write_managed_provenance(node, artifact)
+            effects["provenanceWritten"] = True
+            progress.emit(8, "server-verify", "ok", pid=after["PID"], tls="ok")
+            stage = "client-acceptance"
+            progress.emit(9, "client-verify", "start")
+            run_mihomo_acceptance(node, password, reporter=progress)
+            effects["clientVerified"] = True
+            progress.emit(9, "client-verify", "ok")
+        except SafetyError:
+            report_deploy_failure(node, stage, effects)
+            raise
         print(json.dumps({
             "node": node.name,
             "installed": True,
@@ -1582,7 +2170,7 @@ def execute_command(
 
 
 def _add_node(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--node", required=True, choices=NODE_NAMES)
+    parser.add_argument("--node", required=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1591,6 +2179,18 @@ def build_parser() -> argparse.ArgumentParser:
         description="Operate one declared Czyhandsome Xray node at a time.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    node = sub.add_parser("node")
+    node_sub = node.add_subparsers(dest="node_command", required=True)
+    node_sub.add_parser("list")
+    node_show = node_sub.add_parser("show")
+    node_show.add_argument("node_name")
+    node_add = node_sub.add_parser("add")
+    node_add.add_argument("node_name")
+    node_add.add_argument("--ssh-target", required=True)
+    node_add.add_argument("--domain", required=True)
+    node_add.add_argument("--public-ip")
+    node_add.add_argument("--zone")
 
     credentials = sub.add_parser("credentials")
     credentials_sub = credentials.add_subparsers(dest="credentials_command", required=True)
@@ -1635,15 +2235,23 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(raw_argv)
     try:
         manifest = load_manifest()
-        configs = credential_context_files(args)
-        if configs and os.environ.get(CREDS_CONTEXT_ENV) != "1":
+        require_manager, require_node = credential_context_requirements(args)
+        if (require_manager or require_node) and os.environ.get(CREDS_CONTEXT_ENV) != "1":
             return run_in_credential_context(manifest, args, raw_argv)
-        node = manifest.nodes[getattr(args, "node", "aiyun")]
+        if args.command == "node":
+            return execute_command(
+                args, manifest, SecretBundle(None, None, None)
+            )
+        node_name = getattr(args, "node", "")
+        node = manifest.nodes.get(node_name)
+        if node is None:
+            available = ", ".join(sorted(manifest.nodes))
+            raise SafetyError(f"unknown node {node_name}; available nodes: {available}")
         bundle = consume_secret_bundle(
             manifest,
             node,
-            require_manager=(ROOT / "config" / "credentials-manager.json") in configs,
-            require_node=(ROOT / "config" / f"credentials-{node.name}.json") in configs,
+            require_manager=require_manager,
+            require_node=require_node,
         )
         return execute_command(args, manifest, bundle)
     except KeyboardInterrupt:

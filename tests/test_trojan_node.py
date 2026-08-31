@@ -7,7 +7,9 @@ import json
 import os
 import pathlib
 import shlex
+import stat
 import subprocess
+import tempfile
 import threading
 import tarfile
 import unittest
@@ -39,6 +41,12 @@ class CommandSurfaceTests(unittest.TestCase):
             ("cloudflare", "token", "rotate-dns", "--node", "aiyun2"),
             ("cloudflare", "token", "revoke", "--node", "aiyun"),
             ("host", "check", "--node", "aiyun"),
+            ("node", "list"),
+            ("node", "show", "aiyun"),
+            (
+                "node", "add", "aiyun3", "--ssh-target", "aiyun3",
+                "--domain", "introspect3.czyhandsome.ink",
+            ),
             ("preflight", "--node", "aiyun2"),
             ("deploy", "--node", "aiyun2"),
             ("deploy", "--node", "aiyun2", "--rotate-secrets", "--apply"),
@@ -48,13 +56,13 @@ class CommandSurfaceTests(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsInstance(self.parse(*argv), argparse.Namespace)
 
-    def test_unknown_node_is_rejected_by_parser(self):
-        with self.assertRaises(SystemExit):
-            self.parse("host", "check", "--node", "unknown")
+    def test_parser_accepts_declared_node_names_dynamically(self):
+        parsed = self.parse("host", "check", "--node", "aiyun3")
+        self.assertEqual(parsed.node, "aiyun3")
 
 
 class ManifestTests(unittest.TestCase):
-    def test_manifest_has_exact_two_nodes_and_no_secret_values(self):
+    def test_bundled_manifest_keeps_legacy_nodes_and_no_secret_values(self):
         manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
         self.assertEqual(set(manifest.nodes), {"aiyun", "aiyun2"})
         self.assertEqual(manifest.nodes["aiyun"].address, "23.95.133.118")
@@ -63,11 +71,209 @@ class ManifestTests(unittest.TestCase):
         for forbidden in ("password", "tokenValue", "apiToken", "privateKey"):
             self.assertNotIn(forbidden, text)
 
+    def test_example_manifest_is_parseable(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.example.json")
+        self.assertEqual(set(manifest.nodes), {"example-node"})
+
     def test_manifest_uses_declared_known_hosts_aliases_without_fingerprints(self):
         manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
         self.assertEqual(manifest.nodes["aiyun"].ssh_host_alias, "aiyun")
         self.assertEqual(manifest.nodes["aiyun2"].ssh_host_alias, "aiyun2")
         self.assertNotIn("fingerprint", (ROOT / "config" / "nodes.json").read_text())
+
+    def test_manifest_accepts_an_additional_valid_node(self):
+        raw = json.loads((ROOT / "config" / "nodes.json").read_text())
+        raw["nodes"]["aiyun3"] = {
+            "address": "203.0.113.30",
+            "domain": "introspect3.czyhandsome.ink",
+            "sshUser": "root",
+            "sshPort": 2222,
+            "sshTarget": "aiyun3",
+            "sshHostKey": {
+                "algorithm": "ssh-ed25519",
+                "knownHostsAlias": "aiyun3",
+            },
+            "credential": "trojan-aiyun3",
+            "cloudflareTokenName": "trojan-aiyun3-dns01",
+            "sourceCidr": "203.0.113.30/32",
+        }
+        with mock.patch.object(
+            pathlib.Path, "read_text", return_value=json.dumps(raw)
+        ):
+            manifest = trojan_node.load_manifest(pathlib.Path("nodes.json"))
+        self.assertEqual(set(manifest.nodes), {"aiyun", "aiyun2", "aiyun3"})
+        self.assertEqual(manifest.nodes["aiyun3"].ssh_target, "aiyun3")
+
+    def test_default_loader_prefers_local_inventory_and_falls_back_to_bundled(self):
+        bundled_raw = json.loads((ROOT / "config" / "nodes.json").read_text())
+        local_raw = json.loads(json.dumps(bundled_raw))
+        local_raw["nodes"]["aiyun"]["domain"] = "local.czyhandsome.ink"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            bundled = root / "bundled.json"
+            local = root / "config" / "nodes.json"
+            bundled.write_text(json.dumps(bundled_raw))
+
+            fallback = trojan_node.load_manifest(
+                local_path=local, bundled_path=bundled
+            )
+            self.assertEqual(
+                fallback.nodes["aiyun"].domain,
+                bundled_raw["nodes"]["aiyun"]["domain"],
+            )
+
+            local.parent.mkdir()
+            local.write_text(json.dumps(local_raw))
+            local.chmod(0o600)
+            preferred = trojan_node.load_manifest(
+                local_path=local, bundled_path=bundled
+            )
+            self.assertEqual(
+                preferred.nodes["aiyun"].domain, "local.czyhandsome.ink"
+            )
+
+    def test_manifest_rejects_duplicate_node_identity_fields(self):
+        raw = json.loads((ROOT / "config" / "nodes.json").read_text())
+        raw["nodes"]["aiyun2"]["domain"] = raw["nodes"]["aiyun"]["domain"]
+        with self.assertRaisesRegex(trojan_node.SafetyError, "unique"):
+            trojan_node.parse_manifest(raw)
+
+    def test_local_inventory_with_unsafe_permissions_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local = pathlib.Path(temp_dir) / "nodes.json"
+            local.write_text((ROOT / "config" / "nodes.json").read_text())
+            local.chmod(0o644)
+            with self.assertRaisesRegex(trojan_node.SafetyError, "0600"):
+                trojan_node.load_manifest(
+                    local_path=local,
+                    bundled_path=ROOT / "config" / "nodes.json",
+                )
+
+
+class NodeRegistrationTests(unittest.TestCase):
+    def test_registered_ssh_target_rejects_user_port_or_address_drift(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        node = manifest.nodes["aiyun"]
+        resolved = subprocess.CompletedProcess(
+            [], 0,
+            "hostname 8.8.8.8\nuser deploy\nport 2202\nhostkeyalias aiyun\n",
+            "",
+        )
+        with self.assertRaisesRegex(trojan_node.SafetyError, "changed"):
+            trojan_node.validate_registered_ssh_target(
+                node, runner=lambda *_args, **_kwargs: resolved
+            )
+
+    def test_ssh_target_rejects_shell_syntax_and_requires_public_ip(self):
+        for target in ("aiyun3; uname", "-oProxyCommand=bad", "aiyun3 extra"):
+            with self.subTest(target=target):
+                with self.assertRaises(trojan_node.SafetyError):
+                    trojan_node.resolve_ssh_target(target)
+
+        completed = subprocess.CompletedProcess(
+            [], 0, "hostname node.example.test\nuser deploy\nport 2202\n", ""
+        )
+        with self.assertRaisesRegex(trojan_node.SafetyError, "explicit public"):
+            trojan_node.resolve_ssh_target(
+                "deploy@node.example.test", runner=lambda *_args, **_kwargs: completed
+            )
+        resolved = trojan_node.resolve_ssh_target(
+            "deploy@node.example.test",
+            public_ip="8.8.4.4",
+            runner=lambda *_args, **_kwargs: completed,
+        )
+        self.assertEqual((resolved["user"], resolved["port"]), ("deploy", 2202))
+        self.assertEqual(resolved["hostAlias"], "[node.example.test]:2202")
+
+    def test_local_inventory_refuses_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            real = root / "real.json"
+            real.write_text("{}")
+            link = root / "nodes.json"
+            link.symlink_to(real)
+            with self.assertRaisesRegex(trojan_node.SafetyError, "regular file"):
+                trojan_node.write_local_manifest({"schemaVersion": 1}, link)
+
+    def test_add_resolves_ssh_validates_trust_and_writes_local_inventory(self):
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(argv)
+            if argv[:2] == ["ssh", "-G"]:
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=(
+                        "host aiyun3\n"
+                        "hostname 8.8.4.4\n"
+                        "user root\n"
+                        "port 2222\n"
+                        "hostkeyalias aiyun3\n"
+                    ),
+                    stderr="",
+                )
+            if argv[0] == "ssh-keygen":
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="aiyun3 ssh-ed25519 a2V5\n", stderr=""
+                )
+            if argv[0] == "ssh":
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            raise AssertionError(argv)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = pathlib.Path(temp_dir)
+            local = root / "config" / "nodes.json"
+            args = trojan_node.build_parser().parse_args([
+                "node", "add", "aiyun3",
+                "--ssh-target", "aiyun3",
+                "--domain", "introspect3.czyhandsome.ink",
+            ])
+            node = trojan_node.register_node(
+                args,
+                reader=lambda _prompt: "aiyun3",
+                runner=runner,
+                local_path=local,
+                bundled_path=ROOT / "config" / "nodes.json",
+            )
+            self.assertEqual(node.name, "aiyun3")
+            self.assertEqual(node.address, "8.8.4.4")
+            self.assertEqual(node.ssh_user, "root")
+            self.assertEqual(node.ssh_port, 2222)
+            self.assertEqual(node.ssh_target, "aiyun3")
+            self.assertEqual(node.credential, "trojan-aiyun3")
+            self.assertEqual(node.cloudflare_token_name, "trojan-aiyun3-dns01")
+            self.assertEqual(stat.S_IMODE(local.stat().st_mode), 0o600)
+            raw = json.loads(local.read_text())
+            self.assertEqual(raw["nodes"]["aiyun3"]["sourceCidr"], "8.8.4.4/32")
+            self.assertNotIn("password", local.read_text())
+            self.assertTrue(any(call[:2] == ["ssh", "-G"] for call in calls))
+            self.assertTrue(any(call[0] == "ssh-keygen" for call in calls))
+
+
+class ProgressTests(unittest.TestCase):
+    def test_long_action_emits_secret_safe_heartbeats(self):
+        output = io.StringIO()
+        reporter = trojan_node.ProgressReporter(stream=output)
+        release = threading.Event()
+        timer = threading.Timer(0.04, release.set)
+        timer.start()
+        try:
+            result = trojan_node.run_with_heartbeat(
+                reporter,
+                6,
+                "install-1",
+                lambda: release.wait() or "done",
+                interval_seconds=0.01,
+            )
+        finally:
+            timer.cancel()
+        self.assertTrue(result)
+        text = output.getvalue()
+        self.assertIn("install-1", text)
+        self.assertIn("running", text)
+        self.assertIn("elapsed=", text)
+        self.assertNotIn("password", text)
 
 
 class CredsAdapterTests(unittest.TestCase):
@@ -156,20 +362,51 @@ class CredsAdapterTests(unittest.TestCase):
             )
         self.assertNotIn(secret, str(caught.exception))
 
-    def test_credential_context_reexec_uses_tracked_placeholders_and_no_values(self):
+    def test_credential_context_reexec_generates_and_cleans_node_placeholder(self):
+        raw = json.loads((ROOT / "config" / "nodes.json").read_text())
+        raw["nodes"]["aiyun3"] = {
+            "address": "8.8.4.4",
+            "domain": "introspect3.czyhandsome.ink",
+            "sshUser": "root",
+            "sshPort": 22,
+            "sshTarget": "aiyun3",
+            "sshHostKey": {
+                "algorithm": "ssh-ed25519",
+                "knownHostsAlias": "aiyun3",
+            },
+            "credential": "trojan-aiyun3",
+            "cloudflareTokenName": "trojan-aiyun3-dns01",
+            "sourceCidr": "8.8.4.4/32",
+        }
+        manifest = trojan_node.parse_manifest(raw)
         args = trojan_node.build_parser().parse_args([
-            "deploy", "--node", "aiyun2", "--apply",
+            "deploy", "--node", "aiyun3", "--apply",
         ])
         calls = []
+        temporary_path = None
 
         def runner(argv, **kwargs):
+            nonlocal temporary_path
             calls.append((argv, kwargs))
+            from_paths = [
+                pathlib.Path(argv[index + 1])
+                for index, item in enumerate(argv) if item == "--from"
+            ]
+            temporary_path = from_paths[1]
+            self.assertTrue(temporary_path.is_file())
+            self.assertEqual(stat.S_IMODE(temporary_path.stat().st_mode), 0o600)
+            placeholder = temporary_path.read_text()
+            self.assertIn("<<secret:generic/trojan-aiyun3/password>>", placeholder)
+            self.assertIn(
+                "<<secret:generic/trojan-aiyun3/cloudflare-token>>", placeholder
+            )
+            self.assertNotIn("token-manager-value", placeholder)
             return subprocess.CompletedProcess(argv, 0)
 
         rc = trojan_node.run_in_credential_context(
-            self.manifest,
+            manifest,
             args,
-            ["deploy", "--node", "aiyun2", "--apply"],
+            ["deploy", "--node", "aiyun3", "--apply"],
             runner=runner,
             environ={"PATH": os.environ.get("PATH", "")},
         )
@@ -179,21 +416,18 @@ class CredsAdapterTests(unittest.TestCase):
         from_paths = [argv[index + 1] for index, item in enumerate(argv) if item == "--from"]
         self.assertEqual(from_paths, [
             str(ROOT / "config" / "credentials-manager.json"),
-            str(ROOT / "config" / "credentials-aiyun2.json"),
+            str(temporary_path),
         ])
+        self.assertFalse(temporary_path.exists())
         self.assertEqual(kwargs["env"][trojan_node.CREDS_CONTEXT_ENV], "1")
         combined = " ".join(argv) + json.dumps(kwargs["env"])
         self.assertNotIn("token-manager-value", combined)
 
-    def test_placeholder_configs_contain_no_values_and_separate_nodes(self):
+    def test_only_manager_placeholder_is_repository_tracked(self):
         manager = (ROOT / "config" / "credentials-manager.json").read_text()
-        aiyun = (ROOT / "config" / "credentials-aiyun.json").read_text()
-        aiyun2 = (ROOT / "config" / "credentials-aiyun2.json").read_text()
         self.assertIn("<<secret:generic/cloudflare-czyhandsome/token-manager>>", manager)
-        self.assertIn("<<secret:generic/trojan-aiyun/password>>", aiyun)
-        self.assertNotIn("trojan-aiyun2", aiyun)
-        self.assertIn("<<secret:generic/trojan-aiyun2/password>>", aiyun2)
-        self.assertNotIn("token-manager", aiyun + aiyun2)
+        self.assertFalse((ROOT / "config" / "credentials-aiyun.json").exists())
+        self.assertFalse((ROOT / "config" / "credentials-aiyun2.json").exists())
 
     def test_secret_bundle_is_consumed_from_environment(self):
         manager_key = trojan_node.credential_env_key(
@@ -1005,6 +1239,17 @@ class DispatchTests(unittest.TestCase):
             "password": "PRESENT", "cloudflare-token": "MISSING"
         })
 
+    def test_unknown_node_error_lists_available_ids(self):
+        args = trojan_node.build_parser().parse_args([
+            "host", "check", "--node", "missing"
+        ])
+        with self.assertRaisesRegex(
+            trojan_node.SafetyError, "available nodes: aiyun, aiyun2"
+        ):
+            trojan_node.execute_command(
+                args, self.manifest, trojan_node.SecretBundle(None, None, None)
+            )
+
     def test_deploy_without_apply_is_redacted_and_never_installs(self):
         args = trojan_node.build_parser().parse_args([
             "deploy", "--node", "aiyun2", "--rotate-secrets"
@@ -1072,9 +1317,13 @@ class DispatchTests(unittest.TestCase):
                  trojan_node, "validate_deployable_remote",
                  side_effect=lambda *_args: events.append("validate-provenance"),
              ), mock.patch.object(
+                 trojan_node, "validate_local_acceptance_prerequisites",
+                 side_effect=lambda: events.append("local-prerequisites"),
+             ), mock.patch.object(
                  trojan_node, "confirm_node", return_value=True
              ), mock.patch.object(
-                 trojan_node, "apply_dns_change_with_readback"
+                 trojan_node, "apply_dns_change_with_readback",
+                 side_effect=lambda *_args: events.append("dns-apply"),
              ), mock.patch.object(
                  trojan_node, "stage_and_install",
                  side_effect=lambda *_args: events.append("install"),
@@ -1088,7 +1337,7 @@ class DispatchTests(unittest.TestCase):
                  side_effect=lambda *_args, **_kwargs: events.append("write-provenance"),
              ), mock.patch.object(
                  trojan_node, "run_mihomo_acceptance",
-                 side_effect=lambda *_args: events.append("acceptance"),
+                 side_effect=lambda *_args, **_kwargs: events.append("acceptance"),
              ), mock.patch.object(trojan_node.sys, "stdout", output):
             rc = trojan_node.execute_command(
                 args,
@@ -1101,9 +1350,71 @@ class DispatchTests(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         self.assertEqual(events, [
-            "validate-provenance", "install", "install", "tls",
+            "validate-provenance", "local-prerequisites", "dns-apply",
+            "install", "install", "tls",
             "write-provenance", "acceptance",
         ])
+
+    def test_client_failure_reports_completed_side_effects_and_safe_resume(self):
+        args = trojan_node.build_parser().parse_args([
+            "deploy", "--node", "aiyun2", "--apply",
+        ])
+        node = self.manifest.nodes["aiyun2"]
+        artifact = trojan_node.SourceArtifact("a" * 40, "b" * 64, b"archive")
+        snapshot = {
+            "PID": "4242", "NRESTARTS": "0",
+            "CONFIG_SHA256": "c" * 64, "CERT_SHA256": "d" * 64,
+        }
+        stderr = io.StringIO()
+        with mock.patch.object(
+            trojan_node, "credentials_status",
+            return_value={"password": "PRESENT", "cloudflare-token": "PRESENT"},
+        ), mock.patch.object(trojan_node, "CloudflareClient"), \
+             mock.patch.object(trojan_node, "warn_manager_token_expiry"), \
+             mock.patch.object(
+                 trojan_node, "resolve_unique_zone",
+                 return_value={"id": "zone-1", "name": node.zone, "status": "active"},
+             ), mock.patch.object(
+                 trojan_node, "list_node_dns_records",
+                 return_value=[{
+                     "id": "record-1", "type": "A", "name": node.domain,
+                     "content": node.address, "ttl": 1, "proxied": False,
+                 }],
+             ), mock.patch.object(
+                 trojan_node, "run_remote_preflight", return_value={"STATE": "managed"}
+             ), mock.patch.object(
+                 trojan_node, "build_source_archive", return_value=artifact
+             ), mock.patch.object(trojan_node, "validate_deployable_remote"), \
+             mock.patch.object(
+                 trojan_node, "validate_local_acceptance_prerequisites"
+             ), \
+             mock.patch.object(trojan_node, "confirm_node", return_value=True), \
+             mock.patch.object(trojan_node, "apply_dns_change_with_readback"), \
+             mock.patch.object(trojan_node, "stage_and_install"), \
+             mock.patch.object(trojan_node, "server_snapshot", return_value=snapshot), \
+             mock.patch.object(trojan_node, "verify_online_tls"), \
+             mock.patch.object(trojan_node, "write_managed_provenance"), \
+             mock.patch.object(
+                 trojan_node, "run_mihomo_acceptance",
+                 side_effect=trojan_node.SafetyError("client failed"),
+             ), mock.patch.object(trojan_node.sys, "stderr", stderr):
+            with self.assertRaisesRegex(trojan_node.SafetyError, "client failed"):
+                trojan_node.execute_command(
+                    args,
+                    self.manifest,
+                    trojan_node.SecretBundle(
+                        "manager-test", "password-test", "node-token-test"
+                    ),
+                    reader=lambda _prompt: "aiyun2",
+                )
+
+        diagnostic = stderr.getvalue()
+        self.assertIn("stage=client-acceptance", diagnostic)
+        self.assertIn("serverInstalled=true", diagnostic)
+        self.assertIn("provenanceWritten=true", diagnostic)
+        self.assertIn(
+            "safeResume=trojan-node verify --node aiyun2", diagnostic
+        )
 
 
 class ClientAcceptanceTests(unittest.TestCase):
@@ -1131,6 +1442,37 @@ class ClientAcceptanceTests(unittest.TestCase):
         self.assertIn(secret, config)
         self.assertNotIn("tun:", config.lower())
 
+    def test_acceptance_port_is_allocated_by_the_kernel(self):
+        probe = mock.MagicMock()
+        probe.getsockname.return_value = ("127.0.0.1", 45678)
+        with mock.patch.object(trojan_node.socket, "socket", return_value=probe):
+            self.assertEqual(trojan_node.allocate_acceptance_port(), 45678)
+        probe.bind.assert_called_once_with(("127.0.0.1", 0))
+        probe.close.assert_called_once_with()
+
+    def test_mihomo_start_retries_after_local_port_race(self):
+        first = mock.MagicMock()
+        first.poll.return_value = 1
+        second = mock.MagicMock()
+        second.poll.return_value = None
+        connection = mock.MagicMock()
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            trojan_node, "allocate_acceptance_port", side_effect=[40001, 40002]
+        ), mock.patch.object(
+            trojan_node.subprocess, "Popen", side_effect=[first, second]
+        ) as popen, mock.patch.object(
+            trojan_node.socket, "create_connection", return_value=connection
+        ):
+            process, port = trojan_node.start_isolated_mihomo(
+                "/usr/local/bin/mihomo",
+                temp_dir,
+                self.node,
+                "test-only-password",
+            )
+        self.assertIs(process, second)
+        self.assertEqual(port, 40002)
+        self.assertEqual(popen.call_count, 2)
+
     def test_mihomo_version_accepts_current_bugfix_releases(self):
         self.assertEqual(
             trojan_node.validate_mihomo_version(
@@ -1148,6 +1490,26 @@ class ClientAcceptanceTests(unittest.TestCase):
                 with self.assertRaises(trojan_node.SafetyError):
                     trojan_node.validate_mihomo_version(output)
 
+    def test_local_acceptance_prerequisites_require_mihomo_and_gcp_host_key(self):
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(argv)
+            if argv[0] == "/usr/local/bin/mihomo":
+                return subprocess.CompletedProcess(
+                    argv, 0, "Mihomo Meta v1.19.30 darwin arm64", ""
+                )
+            return subprocess.CompletedProcess(
+                argv, 0, "[34.31.209.55]:50245 ssh-ed25519 AAAATEST", ""
+            )
+
+        with mock.patch.object(
+            trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+        ):
+            trojan_node.validate_local_acceptance_prerequisites(runner=runner)
+        self.assertEqual(calls[0], ["/usr/local/bin/mihomo", "-v"])
+        self.assertEqual(calls[1][0:3], ["ssh-keygen", "-F", "[34.31.209.55]:50245"])
+
     def test_gcp_ssh_acceptance_argv_is_proxy_bound_and_secret_free(self):
         reconnect = trojan_node.gcp_ssh_argv(17890, keepalive_seconds=None)
         soak = trojan_node.gcp_ssh_argv(17890, keepalive_seconds=3600)
@@ -1158,6 +1520,21 @@ class ClientAcceptanceTests(unittest.TestCase):
         self.assertIn("127.0.0.1:17890", joined)
         self.assertEqual(soak[-2:], ["sleep", "3600"])
         self.assertIn("ServerAliveInterval=30", " ".join(soak))
+
+    def test_reconnect_checks_report_bounded_progress(self):
+        stream = io.StringIO()
+        reporter = trojan_node.ProgressReporter(stream=stream)
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(
+            trojan_node.subprocess, "run", return_value=completed
+        ) as run:
+            trojan_node.run_gcp_reconnects(
+                self.node, 45678, reconnects=3, reporter=reporter
+            )
+        self.assertEqual(run.call_count, 3)
+        progress = stream.getvalue()
+        self.assertIn("reconnect=1/3", progress)
+        self.assertIn("reconnect=3/3", progress)
 
 
 if __name__ == "__main__":
