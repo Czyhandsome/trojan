@@ -486,6 +486,25 @@ class CloudflareTokenTests(unittest.TestCase):
         with self.assertRaises(trojan_node.SafetyError):
             trojan_node.resolve_permission_groups(groups + [{"id": "zr2", "name": "Zone Read"}])
 
+    def test_permission_groups_use_the_single_page_api_without_pagination(self):
+        calls = []
+
+        class Client:
+            def request(self, method, path):
+                calls.append((method, path))
+                return [
+                    {"id": "zr", "name": "Zone Read"},
+                    {"id": "dw", "name": "DNS Write"},
+                ]
+
+            def list_paginated(self, *_args, **_kwargs):
+                raise AssertionError("permission groups API is not paginated")
+
+        self.assertEqual(trojan_node._permission_groups(Client()), {
+            "Zone Read": "zr", "DNS Write": "dw"
+        })
+        self.assertEqual(calls, [("GET", "/user/tokens/permission_groups")])
+
     def test_token_store_failure_revokes_new_token_and_preserves_old(self):
         revoked = []
 

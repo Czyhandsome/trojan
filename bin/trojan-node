@@ -1361,9 +1361,10 @@ def _require_manager(bundle: SecretBundle) -> str:
 
 
 def _permission_groups(client: CloudflareClient) -> dict[str, str]:
-    return resolve_permission_groups(
-        client.list_paginated("/user/tokens/permission_groups")
-    )
+    groups = client.request("GET", "/user/tokens/permission_groups")
+    if not isinstance(groups, list) or not all(isinstance(group, dict) for group in groups):
+        raise SafetyError("Cloudflare permission groups response is invalid")
+    return resolve_permission_groups(groups)
 
 
 def rotate_node_credentials(
