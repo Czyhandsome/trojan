@@ -35,6 +35,75 @@ Clash 兼容 canary，不能只看配置语法通过。
 匹配后才允许原子切换。当前脚本固定 Xray `v26.3.27` 和 acme.sh `3.1.4`；
 发布新版本时必须在代码审查中同时更新版本、架构哈希和故障注入用例。
 
+## 双节点本机自动化
+
+`bin/trojan-node` 是本仓库专用的 macOS 本机编排器，不是通用 Cloudflare CLI。
+它只认识 `config/nodes.json` 中的 `aiyun` 和 `aiyun2`，每次只允许操作一台。
+节点 IP、域名、zone、凭据 placeholder 和 token 名是仓库跟踪的非 secret；密码、
+Cloudflare token、SSH 私钥和私钥路径不进入清单。
+
+它依赖 `personal` Keychain profile 以及支持以下机器接口的 canonical `creds`：
+
+```text
+creds set generic NAME FIELD --profile PROFILE --stdin
+creds show generic NAME --fields FIELD... --profile PROFILE --format json
+```
+
+CLI 通过仓库跟踪的 `config/credentials-*.json` placeholder 自动调用 `creds exec`。
+Cloudflare 管理 token 只进入本机进程，节点 password/token 按目标节点隔离；所有子进程
+环境都会移除 `CREDS_*`。新值写回 Keychain 时只走 stdin，不进入 argv 或输出。
+
+### 一次性人工门槛
+
+1. 在 Cloudflare UI 创建 180 天管理 token，保存到
+   `personal/generic/cloudflare-czyhandsome/token-manager`。权限仅为 User 的
+   API Tokens Read/Write，以及精确 `czyhandsome.ink` zone 的 Zone Read/DNS Write；
+   不设置来源 IP。CLI 会在到期 30 天内告警，但不会自动替换管理 token。
+2. 先由人工用 `ssh aiyun` / `ssh aiyun2` 建立并确认本机 SSH 信任，再确认
+   `~/.ssh/known_hosts` 中每个别名恰好有一个 ED25519 条目。CLI 只复用该既有信任，
+   复制到临时 `0600` known_hosts 并设置 `HostKeyAlias`；缺失或重复都会停止，绝不通过
+   `ssh-keyscan` 自动接纳新 key，也不使用 `StrictHostKeyChecking=no`。
+3. 在控制台把当前 Mac 的 SSH 公钥写入 root 的 `authorized_keys`，确认 key-only
+   BatchMode 登录。SSH 私钥不由 `creds` 管理。
+
+### 命令面
+
+```text
+trojan-node credentials status|rotate --node NODE
+trojan-node cloudflare zones
+trojan-node cloudflare dns list|ensure --node NODE
+trojan-node cloudflare token list|rotate-dns|revoke --node NODE
+trojan-node host check --node NODE
+trojan-node preflight --node NODE
+trojan-node deploy --node NODE [--rotate-secrets] [--apply]
+trojan-node verify --node NODE
+```
+
+`deploy` 默认只打印脱敏计划；`--apply` 会显示精确节点、DNS action、Git commit、archive
+SHA-256 和远端动作，并要求输入完整节点名。它从干净 worktree 的精确 commit 构建 tar，
+通过严格 ED25519 临时 `known_hosts` 传入远端 staging，回读 SHA-256，再把 password/token
+放入内存 tar，经 SSH stdin 写入 `/run/trojan-certman-input`。输入副本由 trap 精确清理，
+安装失败仍交给现有事务安装器回滚。
+
+Cloudflare DNS 只允许唯一同名 A 的 no-op/update 或缺失 A 的 create，强制 DNS-only 和
+TTL Auto；多 A、任意同名 AAAA/CNAME、zone 不唯一都会停止，绝不自动删除。节点 DNS
+token 的 permission-group ID 每次动态解析，权限固定为精确 zone 的 Zone Read/DNS Write，
+来源固定为节点 IPv4 `/32`。新 token 必须先写入 Keychain；写入失败会撤销新 token，
+成功后才撤销同名旧节点 token，不碰其他 token。
+
+服务端验收包含 Xray active/enabled、`NRestarts=0`、443 owner/queue、配置权限、timers、
+SAN/证书指纹和关闭端口。隔离客户端固定 Mihomo `v1.19.29`、
+`127.0.0.1:17890`、无 TUN、严格 TLS，随后确认出口 IP、20 次 GCP `:50245` SSH 重连和
+60 分钟 keepalive。它不会修改 Clash Verge。
+
+首次安装并通过服务端与线上 TLS 验证后，CLI 会原子写入
+`/var/lib/trojan-node/provenance.json`：目录 `0700 root:root`，文件 `0600 root:root`，
+只包含节点身份、Git commit 和 archive SHA-256，不含 secret。后续独立 `deploy` 只有在
+该标记字段完全匹配当前精确源码、文件类型/权限正确、Xray 与 TLS 仍健康时才允许按同一
+凭据重跑；managed rerun 禁止 `--rotate-secrets`。部分残留、外来状态、源码不一致或仅仅
+“看起来健康”都会停止。每次成功仍连续运行 installer 两次并比较 PID、重启数、配置和
+证书身份，然后严格回读 provenance。
+
 ## Ubuntu 24.04 从零安装
 
 下面是一份不依赖 AI 的 fresh install 手册。Ubuntu 22.04 的操作相同。它只适用于一台

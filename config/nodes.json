@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "profile": "personal",
+  "zone": "czyhandsome.ink",
+  "managerCredential": {
+    "name": "cloudflare-czyhandsome",
+    "field": "token-manager"
+  },
+  "nodes": {
+    "aiyun": {
+      "address": "23.95.133.118",
+      "domain": "introspect.czyhandsome.ink",
+      "sshUser": "root",
+      "sshPort": 22,
+      "sshHostKey": {
+        "algorithm": "ssh-ed25519",
+        "knownHostsAlias": "aiyun"
+      },
+      "credential": "trojan-aiyun",
+      "cloudflareTokenName": "trojan-aiyun-dns01",
+      "sourceCidr": "23.95.133.118/32"
+    },
+    "aiyun2": {
+      "address": "69.33.3.215",
+      "domain": "introspect2.czyhandsome.ink",
+      "sshUser": "root",
+      "sshPort": 22,
+      "sshHostKey": {
+        "algorithm": "ssh-ed25519",
+        "knownHostsAlias": "aiyun2"
+      },
+      "credential": "trojan-aiyun2",
+      "cloudflareTokenName": "trojan-aiyun2-dns01",
+      "sourceCidr": "69.33.3.215/32"
+    }
+  }
+}

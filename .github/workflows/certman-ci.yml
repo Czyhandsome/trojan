@@ -78,6 +78,22 @@ jobs:
       - name: Bats
         run: bats tests/certman.bats
 
+      - name: Trojan node CLI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -x bin/trojan-node
+          python3 -W error::ResourceWarning -m unittest tests.test_trojan_node
+          PYTHONPYCACHEPREFIX="$RUNNER_TEMP/python-cache" \
+            python3 -m py_compile bin/trojan-node tests/test_trojan_node.py
+
+          if rg -n \
+            '(manager-test-token|test-only-(trojan|high-entropy)|BEGIN (RSA|OPENSSH) PRIVATE KEY)' \
+            bin config README.md; then
+            echo 'test secret or private key marker leaked into production surfaces' >&2
+            exit 1
+          fi
+
       - name: Verify systemd units
         shell: bash
         run: |

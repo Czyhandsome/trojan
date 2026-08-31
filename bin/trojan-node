@@ -1,0 +1,1641 @@
+#!/usr/bin/env python3
+"""Local, fail-closed orchestrator for the two Czyhandsome Xray nodes."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import secrets
+import shlex
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+from typing import Any, NamedTuple
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+DEFAULT_MANIFEST = ROOT / "config" / "nodes.json"
+NODE_NAMES = ("aiyun", "aiyun2")
+CREDS_CONTEXT_ENV = "TROJAN_NODE_CREDS_CONTEXT"
+PROVENANCE_DIR = "/var/lib/trojan-node"
+PROVENANCE_FILE = PROVENANCE_DIR + "/provenance.json"
+
+
+class SafetyError(Exception):
+    """An explicit safety precondition was not satisfied."""
+
+
+class Node(NamedTuple):
+    name: str
+    address: str
+    domain: str
+    ssh_user: str
+    ssh_port: int
+    ssh_algorithm: str
+    ssh_host_alias: str
+    credential: str
+    cloudflare_token_name: str
+    source_cidr: str
+
+
+class Manifest(NamedTuple):
+    profile: str
+    zone: str
+    manager_credential: str
+    manager_field: str
+    nodes: dict[str, Node]
+
+
+class SecretBundle(NamedTuple):
+    manager_token: str | None
+    password: str | None
+    node_token: str | None
+
+
+class SourceArtifact(NamedTuple):
+    commit: str
+    sha256: str
+    data: bytes
+
+
+def _required_string(obj: dict[str, Any], key: str, context: str) -> str:
+    value = obj.get(key)
+    if not isinstance(value, str) or not value:
+        raise SafetyError(f"{context}.{key} must be a non-empty string")
+    return value
+
+
+def load_manifest(path: pathlib.Path = DEFAULT_MANIFEST) -> Manifest:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError(f"cannot load node manifest: {exc}") from None
+    if raw.get("schemaVersion") != 1:
+        raise SafetyError("unsupported node manifest schemaVersion")
+    raw_nodes = raw.get("nodes")
+    if not isinstance(raw_nodes, dict) or set(raw_nodes) != set(NODE_NAMES):
+        raise SafetyError("node manifest must contain exactly aiyun and aiyun2")
+    manager = raw.get("managerCredential")
+    if not isinstance(manager, dict):
+        raise SafetyError("managerCredential must be an object")
+
+    nodes: dict[str, Node] = {}
+    for name in NODE_NAMES:
+        item = raw_nodes[name]
+        if not isinstance(item, dict):
+            raise SafetyError(f"nodes.{name} must be an object")
+        host_key = item.get("sshHostKey")
+        if not isinstance(host_key, dict):
+            raise SafetyError(f"nodes.{name}.sshHostKey must be an object")
+        port = item.get("sshPort")
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise SafetyError(f"nodes.{name}.sshPort is invalid")
+        nodes[name] = Node(
+            name=name,
+            address=_required_string(item, "address", f"nodes.{name}"),
+            domain=_required_string(item, "domain", f"nodes.{name}"),
+            ssh_user=_required_string(item, "sshUser", f"nodes.{name}"),
+            ssh_port=port,
+            ssh_algorithm=_required_string(host_key, "algorithm", f"nodes.{name}.sshHostKey"),
+            ssh_host_alias=_required_string(
+                host_key, "knownHostsAlias", f"nodes.{name}.sshHostKey"
+            ),
+            credential=_required_string(item, "credential", f"nodes.{name}"),
+            cloudflare_token_name=_required_string(
+                item, "cloudflareTokenName", f"nodes.{name}"
+            ),
+            source_cidr=_required_string(item, "sourceCidr", f"nodes.{name}"),
+        )
+    return Manifest(
+        profile=_required_string(raw, "profile", "manifest"),
+        zone=_required_string(raw, "zone", "manifest"),
+        manager_credential=_required_string(manager, "name", "managerCredential"),
+        manager_field=_required_string(manager, "field", "managerCredential"),
+        nodes=nodes,
+    )
+
+
+def fingerprint_known_host(key_line: str, node: Node) -> str:
+    lines = [
+        line.strip() for line in key_line.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    parsed: list[tuple[str, str]] = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 3 or parts[1] != node.ssh_algorithm:
+            continue
+        parsed.append((parts[1], parts[2]))
+    if len(parsed) != 1:
+        raise SafetyError(f"{node.name}: expected exactly one trusted ED25519 host key")
+    try:
+        public_key = base64.b64decode(parsed[0][1], validate=True)
+    except (ValueError, TypeError):
+        raise SafetyError(f"{node.name}: malformed ED25519 host key") from None
+    digest = base64.b64encode(hashlib.sha256(public_key).digest()).decode().rstrip("=")
+    return "SHA256:" + digest
+
+
+def load_trusted_known_host(
+    node: Node,
+    known_hosts_path: pathlib.Path | None = None,
+    *,
+    runner: Any = subprocess.run,
+) -> str:
+    source = pathlib.Path.home() / ".ssh" / "known_hosts" if known_hosts_path is None else known_hosts_path
+    argv = [
+        "ssh-keygen", "-F", node.ssh_host_alias, "-f", str(source),
+    ]
+    completed = runner(argv, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise SafetyError(f"{node.name}: trusted known_hosts alias is missing")
+    lines = [
+        line.strip() for line in completed.stdout.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    matching = [line for line in lines if len(line.split()) == 3 and line.split()[1] == node.ssh_algorithm]
+    if len(matching) != 1:
+        raise SafetyError(f"{node.name}: trusted ED25519 known_hosts entry is ambiguous")
+    fingerprint_known_host(matching[0], node)
+    return matching[0] + "\n"
+
+
+def run_verified_ssh(
+    node: Node,
+    remote_argv: list[str],
+    *,
+    input_data: bytes | None = None,
+    known_hosts_path: pathlib.Path | None = None,
+    runner: Any = subprocess.run,
+) -> str:
+    key_line = load_trusted_known_host(
+        node, known_hosts_path=known_hosts_path, runner=runner
+    )
+    temporary_known_hosts: pathlib.Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="trojan-node-known-hosts-", delete=False
+        ) as handle:
+            handle.write(key_line)
+            temporary_known_hosts = pathlib.Path(handle.name)
+        os.chmod(temporary_known_hosts, 0o600)
+        argv = [
+            "ssh",
+            "-p", str(node.ssh_port),
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=yes",
+            "-o", f"UserKnownHostsFile={temporary_known_hosts}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", f"HostKeyAlias={node.ssh_host_alias}",
+            "-o", "HostKeyAlgorithms=ssh-ed25519",
+            "-o", "ConnectTimeout=15",
+            f"{node.ssh_user}@{node.address}",
+            "--",
+            *remote_argv,
+        ]
+        run_kwargs: dict[str, Any] = {
+            "capture_output": True,
+            "check": False,
+            "env": {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("CREDS_") and key != CREDS_CONTEXT_ENV
+            },
+        }
+        if input_data is None:
+            run_kwargs["text"] = True
+        else:
+            run_kwargs["input"] = input_data
+            run_kwargs["text"] = False
+        completed = runner(argv, **run_kwargs)
+        if completed.returncode != 0:
+            raise SafetyError(f"{node.name}: strict SSH command failed")
+        if isinstance(completed.stdout, bytes):
+            return completed.stdout.decode("utf-8", errors="replace")
+        return completed.stdout
+    finally:
+        if temporary_known_hosts is not None:
+            try:
+                temporary_known_hosts.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def credentials_status(
+    manifest: Manifest,
+    node: Node,
+    *,
+    runner: Any = subprocess.run,
+) -> dict[str, str]:
+    argv = [
+        "creds", "show", "generic", node.credential,
+        "--fields", "password", "cloudflare-token",
+        "--profile", manifest.profile, "--format", "json",
+    ]
+    completed = runner(argv, text=True, capture_output=True, check=False)
+    if completed.returncode != 0:
+        raise SafetyError(f"{node.name}: credential presence check failed")
+    try:
+        payload = json.loads(completed.stdout)
+        fields = payload["fields"]
+        if payload.get("schemaVersion") != 1 or not isinstance(fields, list):
+            raise ValueError
+        statuses = {item["name"]: item["status"] for item in fields}
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise SafetyError(f"{node.name}: malformed credential presence response") from None
+    if set(statuses) != {"password", "cloudflare-token"}:
+        raise SafetyError(f"{node.name}: incomplete credential presence response")
+    if any(status not in {"PRESENT", "MISSING"} for status in statuses.values()):
+        raise SafetyError(f"{node.name}: credential backend reported an error")
+    return statuses
+
+
+def store_credential_field(
+    manifest: Manifest,
+    node: Node,
+    field: str,
+    value: str,
+    *,
+    runner: Any = subprocess.run,
+) -> None:
+    if field not in {"password", "cloudflare-token"}:
+        raise SafetyError(f"unsupported node credential field: {field}")
+    if not value or "\x00" in value:
+        raise SafetyError("generated credential value is invalid")
+    argv = [
+        "creds", "set", "generic", node.credential, field,
+        "--profile", manifest.profile, "--stdin",
+    ]
+    completed = runner(
+        argv,
+        input=value + "\n",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise SafetyError(f"{node.name}: failed to store {field} in creds")
+
+
+def credential_context_files(args: argparse.Namespace) -> list[pathlib.Path]:
+    manager = ROOT / "config" / "credentials-manager.json"
+    if args.command == "credentials":
+        return [] if args.credentials_command == "status" else [manager]
+    if args.command == "host":
+        return []
+    if args.command == "verify":
+        return [ROOT / "config" / f"credentials-{args.node}.json"]
+    if args.command == "deploy" and args.apply and not args.rotate_secrets:
+        return [manager, ROOT / "config" / f"credentials-{args.node}.json"]
+    return [manager]
+
+
+def run_in_credential_context(
+    manifest: Manifest,
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    *,
+    runner: Any = subprocess.run,
+    environ: dict[str, str] | None = None,
+) -> int:
+    configs = credential_context_files(args)
+    if not configs:
+        raise SafetyError("this command does not require a credential context")
+    for path in configs:
+        if not path.is_file():
+            raise SafetyError(f"credential placeholder config is missing: {path.name}")
+    argv = ["creds", "exec"]
+    for path in configs:
+        argv.extend(["--from", str(path)])
+    argv.extend([
+        "--profile", manifest.profile,
+        "--", sys.executable, str(pathlib.Path(__file__).resolve()), *raw_argv,
+    ])
+    child_env = dict(os.environ if environ is None else environ)
+    child_env[CREDS_CONTEXT_ENV] = "1"
+    completed = runner(argv, env=child_env, check=False)
+    return completed.returncode
+
+
+def credential_env_key(name: str, field: str) -> str:
+    path = f"generic/{name}/{field}"
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").upper()
+    return "CREDS_" + normalized
+
+
+def consume_secret_bundle(
+    manifest: Manifest,
+    node: Node,
+    *,
+    require_manager: bool,
+    require_node: bool,
+    environ: dict[str, str] | None = None,
+) -> SecretBundle:
+    source = os.environ if environ is None else environ
+    manager = source.pop(
+        credential_env_key(manifest.manager_credential, manifest.manager_field), None
+    )
+    password = source.pop(credential_env_key(node.credential, "password"), None)
+    node_token = source.pop(
+        credential_env_key(node.credential, "cloudflare-token"), None
+    )
+    if require_manager and not manager:
+        raise SafetyError("required Cloudflare manager credential is unavailable")
+    if require_node and (not password or not node_token):
+        raise SafetyError(f"{node.name}: required node credentials are unavailable")
+    return SecretBundle(manager, password, node_token)
+
+
+class CloudflareClient:
+    """Small Cloudflare v4 client with redacted failures and bounded paging."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        base_url: str = "https://api.cloudflare.com/client/v4",
+        timeout: float = 20.0,
+    ) -> None:
+        if not token:
+            raise SafetyError("Cloudflare manager token is unavailable")
+        self._token = token
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        query: dict[str, str | int] | None = None,
+    ) -> Any:
+        url = self.base_url + path
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        data = None if body is None else json.dumps(body, separators=(",", ":")).encode()
+        request = urllib.request.Request(
+            url,
+            method=method,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "czyhandsome-trojan-node/1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise SafetyError(f"Cloudflare API {method} {path} failed") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise SafetyError(f"Cloudflare API {method} {path} failed") from None
+        try:
+            payload = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise SafetyError(f"Cloudflare API {method} {path} returned malformed JSON") from None
+        if not isinstance(payload, dict) or payload.get("success") is not True:
+            raise SafetyError(f"Cloudflare API {method} {path} was unsuccessful")
+        if "result" not in payload:
+            raise SafetyError(f"Cloudflare API {method} {path} omitted result")
+        return payload["result"]
+
+    def _page(
+        self,
+        path: str,
+        query: dict[str, str | int],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        url = self.base_url + path + "?" + urllib.parse.urlencode(query)
+        request = urllib.request.Request(
+            url,
+            method="GET",
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Accept": "application/json",
+                "User-Agent": "czyhandsome-trojan-node/1",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except urllib.error.HTTPError as exc:
+            exc.close()
+            raise SafetyError(f"Cloudflare API GET {path} failed") from None
+        except (urllib.error.URLError, TimeoutError, OSError):
+            raise SafetyError(f"Cloudflare API GET {path} failed") from None
+        try:
+            payload = json.loads(raw)
+            result = payload["result"]
+            info = payload.get("result_info") or {}
+        except (KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            raise SafetyError(f"Cloudflare API GET {path} returned malformed JSON") from None
+        if payload.get("success") is not True or not isinstance(result, list) or not isinstance(info, dict):
+            raise SafetyError(f"Cloudflare API GET {path} was unsuccessful")
+        if not all(isinstance(item, dict) for item in result):
+            raise SafetyError(f"Cloudflare API GET {path} returned invalid items")
+        return result, info
+
+    def list_paginated(
+        self,
+        path: str,
+        query: dict[str, str | int] | None = None,
+    ) -> list[dict[str, Any]]:
+        base_query = dict(query or {})
+        base_query.setdefault("per_page", 50)
+        collected: list[dict[str, Any]] = []
+        for page in range(1, 101):
+            page_query = {**base_query, "page": page}
+            items, info = self._page(path, page_query)
+            collected.extend(items)
+            total_count = info.get("total_count")
+            if isinstance(total_count, int):
+                if len(collected) >= total_count:
+                    return collected
+            elif len(items) < int(base_query["per_page"]):
+                return collected
+            if not items:
+                return collected
+        raise SafetyError(f"Cloudflare API GET {path} exceeded pagination limit")
+
+    def list_tokens(self) -> list[dict[str, Any]]:
+        return self.list_paginated("/user/tokens")
+
+    def create_token(self, payload: dict[str, Any]) -> dict[str, Any]:
+        result = self.request("POST", "/user/tokens", body=payload)
+        if not isinstance(result, dict):
+            raise SafetyError("Cloudflare create token returned invalid result")
+        return result
+
+    def revoke_token(self, token_id: str) -> None:
+        self.request("DELETE", f"/user/tokens/{urllib.parse.quote(token_id, safe='')}")
+
+
+def resolve_unique_zone(client: CloudflareClient, zone_name: str) -> dict[str, Any]:
+    zones = client.list_paginated("/zones", {"name": zone_name})
+    exact = [zone for zone in zones if zone.get("name") == zone_name]
+    if len(exact) != 1:
+        raise SafetyError(f"Cloudflare zone {zone_name!r} is not unique")
+    zone = exact[0]
+    if zone.get("status") != "active":
+        raise SafetyError(f"Cloudflare zone {zone_name!r} is not active")
+    if not isinstance(zone.get("id"), str) or not zone["id"]:
+        raise SafetyError(f"Cloudflare zone {zone_name!r} has no stable ID")
+    return zone
+
+
+def manager_token_expiry_warning(
+    token_metadata: Any,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    if not isinstance(token_metadata, dict):
+        return None
+    expires_on = token_metadata.get("expires_on")
+    if not isinstance(expires_on, str) or not expires_on:
+        return None
+    try:
+        expires = datetime.fromisoformat(expires_on.replace("Z", "+00:00"))
+    except ValueError:
+        raise SafetyError("Cloudflare manager token expiry metadata is malformed") from None
+    current = datetime.now(timezone.utc) if now is None else now
+    remaining = expires - current
+    if remaining.total_seconds() <= 30 * 24 * 60 * 60:
+        days = max(0, int(remaining.total_seconds() // (24 * 60 * 60)))
+        return f"Cloudflare manager token expires in {days} day(s)"
+    return None
+
+
+def manager_token_metadata(client: CloudflareClient) -> dict[str, Any]:
+    verified = client.request("GET", "/user/tokens/verify")
+    if not isinstance(verified, dict) or verified.get("status") != "active":
+        raise SafetyError("Cloudflare manager token is not active")
+    if isinstance(verified.get("expires_on"), str):
+        return verified
+    token_id = verified.get("id")
+    if not isinstance(token_id, str) or not token_id:
+        return verified
+    matches = [token for token in client.list_tokens() if token.get("id") == token_id]
+    if len(matches) != 1:
+        raise SafetyError("Cloudflare manager token metadata is not unique")
+    return matches[0]
+
+
+def warn_manager_token_expiry(client: CloudflareClient) -> None:
+    warning = manager_token_expiry_warning(
+        manager_token_metadata(client)
+    )
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+
+def list_node_dns_records(
+    client: CloudflareClient,
+    zone_id: str,
+    domain: str,
+) -> list[dict[str, Any]]:
+    return client.list_paginated(
+        f"/zones/{urllib.parse.quote(zone_id, safe='')}/dns_records",
+        {"name": domain},
+    )
+
+
+def plan_dns_change(records: list[dict[str, Any]], node: Node) -> dict[str, str]:
+    exact = [record for record in records if record.get("name") == node.domain]
+    if any(record.get("type") in {"AAAA", "CNAME"} for record in exact):
+        raise SafetyError(f"{node.name}: conflicting AAAA or CNAME record exists")
+    a_records = [record for record in exact if record.get("type") == "A"]
+    if len(a_records) > 1:
+        raise SafetyError(f"{node.name}: multiple A records exist")
+    if not a_records:
+        return {"action": "create"}
+    record = a_records[0]
+    if (
+        record.get("content") == node.address
+        and record.get("ttl") == 1
+        and record.get("proxied") is False
+    ):
+        return {"action": "noop"}
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id:
+        raise SafetyError(f"{node.name}: existing A record has no stable ID")
+    return {"action": "update", "record_id": record_id}
+
+
+def apply_dns_change(
+    client: CloudflareClient,
+    zone_id: str,
+    node: Node,
+    plan: dict[str, str],
+) -> None:
+    payload = {
+        "type": "A",
+        "name": node.domain,
+        "content": node.address,
+        "ttl": 1,
+        "proxied": False,
+    }
+    action = plan.get("action")
+    if action == "noop":
+        return
+    if action == "create":
+        client.request("POST", f"/zones/{zone_id}/dns_records", body=payload, query=None)
+        return
+    if action == "update":
+        record_id = urllib.parse.quote(plan["record_id"], safe="")
+        client.request(
+            "PUT", f"/zones/{zone_id}/dns_records/{record_id}", body=payload, query=None
+        )
+        return
+    raise SafetyError(f"{node.name}: invalid DNS plan")
+
+
+def apply_dns_change_with_readback(
+    client: CloudflareClient,
+    zone_id: str,
+    node: Node,
+    plan: dict[str, str],
+) -> None:
+    apply_dns_change(client, zone_id, node, plan)
+    records = list_node_dns_records(client, zone_id, node.domain)
+    if plan_dns_change(records, node).get("action") != "noop":
+        raise SafetyError(f"{node.name}: DNS write readback did not converge")
+
+
+def resolve_permission_groups(groups: list[dict[str, Any]]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for required in ("Zone Read", "DNS Write"):
+        matches = [item for item in groups if item.get("name") == required]
+        if len(matches) != 1 or not isinstance(matches[0].get("id"), str):
+            raise SafetyError(f"Cloudflare permission group {required!r} is not unique")
+        resolved[required] = matches[0]["id"]
+    return resolved
+
+
+def build_dns_token_payload(
+    node: Node,
+    zone_id: str,
+    permission_groups: dict[str, str],
+) -> dict[str, Any]:
+    if set(permission_groups) != {"Zone Read", "DNS Write"}:
+        raise SafetyError("minimum Cloudflare permission groups are incomplete")
+    return {
+        "name": node.cloudflare_token_name,
+        "policies": [{
+            "effect": "allow",
+            "permission_groups": [
+                {"id": permission_groups["Zone Read"]},
+                {"id": permission_groups["DNS Write"]},
+            ],
+            "resources": {
+                f"com.cloudflare.api.account.zone.{zone_id}": "*",
+            },
+        }],
+        "condition": {"request_ip": {"in": [node.source_cidr]}},
+    }
+
+
+def rotate_dns_token(
+    client: CloudflareClient,
+    manifest: Manifest,
+    node: Node,
+    zone_id: str,
+    permission_groups: dict[str, str],
+    *,
+    store: Any = store_credential_field,
+) -> tuple[str, str]:
+    existing = [
+        token for token in client.list_tokens()
+        if token.get("name") == node.cloudflare_token_name
+    ]
+    created = client.create_token(
+        build_dns_token_payload(node, zone_id, permission_groups)
+    )
+    token_id = created.get("id")
+    token_value = created.get("value")
+    if not isinstance(token_id, str) or not token_id or not isinstance(token_value, str) or not token_value:
+        raise SafetyError(f"{node.name}: Cloudflare did not return the new token once")
+    try:
+        store(manifest, node, "cloudflare-token", token_value)
+    except Exception:
+        try:
+            client.revoke_token(token_id)
+        except Exception:
+            raise SafetyError(
+                f"{node.name}: credential store failed and new token compensation failed"
+            ) from None
+        raise SafetyError(
+            f"{node.name}: credential store failed; new token was revoked"
+        ) from None
+    for old in existing:
+        old_id = old.get("id")
+        if isinstance(old_id, str) and old_id and old_id != token_id:
+            client.revoke_token(old_id)
+    current = [
+        token for token in client.list_tokens()
+        if token.get("name") == node.cloudflare_token_name
+    ]
+    if len(current) != 1 or current[0].get("id") != token_id:
+        raise SafetyError(f"{node.name}: node token readback did not converge")
+    return token_id, token_value
+
+
+def revoke_named_node_tokens(client: CloudflareClient, node: Node) -> int:
+    matching = [
+        token for token in client.list_tokens()
+        if token.get("name") == node.cloudflare_token_name
+    ]
+    for token in matching:
+        token_id = token.get("id")
+        if not isinstance(token_id, str) or not token_id:
+            raise SafetyError(f"{node.name}: matching token has no stable ID")
+        client.revoke_token(token_id)
+    remaining = [
+        token for token in client.list_tokens()
+        if token.get("name") == node.cloudflare_token_name
+    ]
+    if remaining:
+        raise SafetyError(f"{node.name}: node token revoke readback did not converge")
+    return len(matching)
+
+
+def build_source_archive(
+    repo_root: pathlib.Path = ROOT,
+    *,
+    runner: Any = subprocess.run,
+) -> SourceArtifact:
+    status = runner(
+        ["git", "status", "--porcelain"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if status.returncode != 0:
+        raise SafetyError("cannot inspect local Git worktree")
+    if status.stdout:
+        raise SafetyError("local Git worktree is not clean")
+    revision = runner(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    commit = revision.stdout.strip() if revision.returncode == 0 else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise SafetyError("cannot resolve exact local Git commit")
+    archived = runner(
+        ["git", "archive", "--format=tar", commit],
+        cwd=repo_root,
+        capture_output=True,
+        check=False,
+    )
+    if archived.returncode != 0 or not isinstance(archived.stdout, bytes) or not archived.stdout:
+        raise SafetyError("cannot build exact source archive")
+    return SourceArtifact(commit, hashlib.sha256(archived.stdout).hexdigest(), archived.stdout)
+
+
+def build_secret_tar(password: str, cloudflare_token: str) -> bytes:
+    if not password or not cloudflare_token or "\x00" in password or "\x00" in cloudflare_token:
+        raise SafetyError("node secret input is invalid")
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, value in (
+            ("trojan-password", password),
+            ("cloudflare-token", cloudflare_token),
+        ):
+            raw = value.encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            info.mode = 0o600
+            info.uid = 0
+            info.gid = 0
+            info.uname = "root"
+            info.gname = "root"
+            info.mtime = 0
+            archive.addfile(info, io.BytesIO(raw))
+    return output.getvalue()
+
+
+def validate_remote_preflight(output: str, node: Node) -> dict[str, str]:
+    facts: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            raise SafetyError(f"{node.name}: malformed remote preflight response")
+        key, value = line.split("=", 1)
+        if key in facts or not re.fullmatch(r"[A-Z0-9_]+", key):
+            raise SafetyError(f"{node.name}: malformed remote preflight response")
+        facts[key] = value
+    required = {
+        "OS_ID", "OS_VERSION", "ARCH", "LISTEN_443", "MANAGED_STATE",
+        "ACME_HOME", "PROVENANCE",
+    }
+    if set(facts) != required:
+        raise SafetyError(f"{node.name}: incomplete remote preflight response")
+    if facts["OS_ID"] != "ubuntu" or facts["OS_VERSION"] != "24.04":
+        raise SafetyError(f"{node.name}: fresh install requires Ubuntu 24.04")
+    if facts["ARCH"] not in {"x86_64", "aarch64"}:
+        raise SafetyError(f"{node.name}: unsupported architecture")
+    clean = all(facts[key] == "0" for key in (
+        "LISTEN_443", "MANAGED_STATE", "ACME_HOME", "PROVENANCE"
+    ))
+    managed_count = facts["MANAGED_STATE"]
+    managed = (
+        facts["LISTEN_443"] == "1"
+        and managed_count.isdigit()
+        and int(managed_count) > 0
+        and facts["ACME_HOME"] == "1"
+        and facts["PROVENANCE"] == "1"
+    )
+    if not clean and not managed:
+        raise SafetyError(f"{node.name}: conflicting or unowned managed state exists")
+    facts["STATE"] = "clean" if clean else "managed"
+    return facts
+
+
+def build_managed_provenance(
+    node: Node,
+    artifact: SourceArtifact,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "node": node.name,
+        "address": node.address,
+        "domain": node.domain,
+        "gitCommit": artifact.commit,
+        "archiveSha256": artifact.sha256,
+    }
+
+
+def validate_managed_provenance(
+    payload: Any,
+    node: Node,
+    artifact: SourceArtifact,
+) -> dict[str, Any]:
+    expected = build_managed_provenance(node, artifact)
+    if not isinstance(payload, dict) or payload != expected:
+        raise SafetyError(f"{node.name}: managed provenance does not match this source")
+    return payload
+
+
+def read_managed_provenance(
+    node: Node,
+    *,
+    ssh_runner: Any = run_verified_ssh,
+) -> dict[str, Any]:
+    script = f"""set -eu
+dir={shlex.quote(PROVENANCE_DIR)}
+file={shlex.quote(PROVENANCE_FILE)}
+test -d "$dir" && test ! -L "$dir"
+test "$(stat -c '%U:%G:%a' "$dir")" = 'root:root:700'
+test -f "$file" && test ! -L "$file"
+test "$(stat -c '%U:%G:%a' "$file")" = 'root:root:600'
+cat "$file"
+"""
+    output = ssh_runner(node, ["sh", "-c", script])
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        raise SafetyError(f"{node.name}: managed provenance is malformed") from None
+    if not isinstance(payload, dict):
+        raise SafetyError(f"{node.name}: managed provenance is malformed")
+    return payload
+
+
+def write_managed_provenance(
+    node: Node,
+    artifact: SourceArtifact,
+    *,
+    ssh_runner: Any = run_verified_ssh,
+) -> dict[str, Any]:
+    payload = build_managed_provenance(node, artifact)
+    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    script = f"""set -eu
+umask 077
+dir={shlex.quote(PROVENANCE_DIR)}
+file={shlex.quote(PROVENANCE_FILE)}
+if [ -e "$dir" ] || [ -L "$dir" ]; then
+  test -d "$dir" && test ! -L "$dir"
+  test "$(stat -c '%U:%G:%a' "$dir")" = 'root:root:700'
+else
+  install -d -m 0700 -o root -g root "$dir"
+fi
+if [ -e "$file" ] || [ -L "$file" ]; then
+  test -f "$file" && test ! -L "$file"
+  test "$(stat -c '%U:%G:%a' "$file")" = 'root:root:600'
+fi
+tmp="$dir/.provenance.$$"
+test ! -e "$tmp" && test ! -L "$tmp"
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+install -m 0600 -o root -g root /dev/null "$tmp"
+cat >"$tmp"
+test "$(stat -c '%U:%G:%a' "$tmp")" = 'root:root:600'
+mv -f -- "$tmp" "$file"
+trap - EXIT HUP INT TERM
+"""
+    ssh_runner(node, ["sh", "-c", script], input_data=data)
+    return validate_managed_provenance(
+        read_managed_provenance(node, ssh_runner=ssh_runner), node, artifact
+    )
+
+
+def require_rerun_secret_policy(
+    remote: dict[str, str],
+    *,
+    rotate_secrets: bool,
+    node: Node,
+) -> None:
+    if remote.get("STATE") == "managed" and rotate_secrets:
+        raise SafetyError(
+            f"{node.name}: --rotate-secrets is forbidden for a managed rerun"
+        )
+
+
+def validate_deployable_remote(
+    node: Node,
+    artifact: SourceArtifact,
+    remote: dict[str, str],
+) -> None:
+    if remote.get("STATE") == "clean":
+        return
+    if remote.get("STATE") != "managed":
+        raise SafetyError(f"{node.name}: remote state is not deployable")
+    validate_managed_provenance(
+        read_managed_provenance(node), node, artifact
+    )
+    snapshot = server_snapshot(node)
+    verify_online_tls(node, expected_sha256=snapshot["CERT_SHA256"])
+
+
+def stage_and_install(
+    node: Node,
+    artifact: SourceArtifact,
+    password: str,
+    cloudflare_token: str,
+    *,
+    ssh_runner: Any = run_verified_ssh,
+) -> None:
+    if not re.fullmatch(r"[0-9a-f]{40}", artifact.commit) or not re.fullmatch(
+        r"[0-9a-f]{64}", artifact.sha256
+    ):
+        raise SafetyError("source artifact identity is invalid")
+    stage = f"/root/trojan-node-staging/{artifact.commit}"
+    q_stage = shlex.quote(stage)
+    q_hash = shlex.quote(artifact.sha256)
+    stage_script = f"""set -eu
+umask 077
+stage={q_stage}
+install -d -m 0700 "$stage"
+incoming="$stage/source.tar.incoming"
+trap 'rm -f -- "$incoming"' EXIT HUP INT TERM
+cat >"$incoming"
+printf '%s  %s\n' {q_hash} "$incoming" | sha256sum --check --strict
+if [ -e "$stage/source" ]; then
+  test -f "$stage/source.sha256"
+  test "$(cat "$stage/source.sha256")" = {q_hash}
+else
+  install -d -m 0700 "$stage/source"
+  tar -xf "$incoming" -C "$stage/source"
+  printf '%s\n' {q_hash} >"$stage/source.sha256"
+fi
+rm -f -- "$incoming"
+trap - EXIT HUP INT TERM
+"""
+    ssh_runner(node, ["sh", "-c", stage_script], input_data=artifact.data)
+
+    secret_tar = build_secret_tar(password, cloudflare_token)
+    q_domain = shlex.quote(node.domain)
+    install_script = f"""set -eu
+umask 077
+stage={q_stage}
+input=/run/trojan-certman-input
+test ! -e "$input"
+install -d -m 0700 -o root -g root "$input"
+cleanup() {{
+  rm -f -- "$input/trojan-password" "$input/cloudflare-token"
+  rmdir "$input" 2>/dev/null || true
+}}
+trap cleanup EXIT HUP INT TERM
+tar --no-same-owner -xf - -C "$input"
+test -f "$input/trojan-password" && test ! -L "$input/trojan-password"
+test -f "$input/cloudflare-token" && test ! -L "$input/cloudflare-token"
+chmod 0600 "$input/trojan-password" "$input/cloudflare-token"
+cd "$stage/source"
+env CERT_DOMAIN={q_domain} \
+  CERTMAN_PASSWORD_INPUT_FILE="$input/trojan-password" \
+  CERTMAN_CF_TOKEN_INPUT_FILE="$input/cloudflare-token" \
+  ./install-with-certman.sh install
+"""
+    ssh_runner(node, ["sh", "-c", install_script], input_data=secret_tar)
+
+
+def build_deployment_plan(
+    node: Node,
+    artifact: SourceArtifact,
+    dns_plan: dict[str, str],
+    *,
+    rotate_secrets: bool,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": 1,
+        "node": node.name,
+        "address": node.address,
+        "domain": node.domain,
+        "gitCommit": artifact.commit,
+        "archiveSha256": artifact.sha256,
+        "dnsAction": dns_plan["action"],
+        "rotateSecrets": rotate_secrets,
+        "remoteActions": [
+            "strict-host-key preflight",
+            "stage verified source archive",
+            "write root-only in-memory inputs",
+            "run transactional installer",
+            "verify and repeat no-op install",
+        ],
+    }
+
+
+def confirm_node(node: Node, *, reader: Any = input) -> bool:
+    return reader(f"Type {node.name} to apply this node only: ").strip() == node.name
+
+
+REMOTE_PREFLIGHT_SCRIPT = rf"""set -eu
+. /etc/os-release
+printf 'OS_ID=%s\n' "$ID"
+printf 'OS_VERSION=%s\n' "$VERSION_ID"
+printf 'ARCH=%s\n' "$(uname -m)"
+listen_443=$(ss -H -ltn 'sport = :443' | wc -l | tr -d ' ')
+printf 'LISTEN_443=%s\n' "$listen_443"
+managed=0
+for path in \
+  /etc/xray \
+  /etc/trojan-certman-v3 \
+  /var/lib/trojan-certman-v3 \
+  /usr/local/lib/xray \
+  /usr/local/lib/trojan-certman-v3 \
+  /usr/local/bin/xray \
+  /usr/local/sbin/trojan-certman \
+  /usr/local/sbin/trojan-certman-v3 \
+  /etc/sysctl.d/90-trojan-xray-capacity.conf \
+  /etc/systemd/system/xray.service \
+  /etc/systemd/system/trojan-certman-renew.service \
+  /etc/systemd/system/trojan-certman-renew.timer \
+  /etc/systemd/system/trojan-certman-snapshot.service \
+  /etc/systemd/system/trojan-certman-snapshot.timer
+do
+  if [ -e "$path" ] || [ -L "$path" ]; then managed=$((managed + 1)); fi
+done
+printf 'MANAGED_STATE=%s\n' "$managed"
+if [ -e /root/.acme.sh ] || [ -L /root/.acme.sh ]; then
+  printf 'ACME_HOME=1\n'
+else
+  printf 'ACME_HOME=0\n'
+fi
+provenance=0
+if [ -e {PROVENANCE_DIR} ] || [ -L {PROVENANCE_DIR} ]; then
+  if [ -d {PROVENANCE_DIR} ] && [ ! -L {PROVENANCE_DIR} ] \
+    && [ "$(stat -c '%U:%G:%a' {PROVENANCE_DIR})" = 'root:root:700' ] \
+    && [ -f {PROVENANCE_FILE} ] && [ ! -L {PROVENANCE_FILE} ] \
+    && [ "$(stat -c '%U:%G:%a' {PROVENANCE_FILE})" = 'root:root:600' ]; then
+    provenance=1
+  else
+    provenance=2
+  fi
+fi
+printf 'PROVENANCE=%s\n' "$provenance"
+"""
+
+
+def run_remote_preflight(
+    node: Node,
+    *,
+    ssh_runner: Any = run_verified_ssh,
+) -> dict[str, str]:
+    output = ssh_runner(node, ["sh", "-c", REMOTE_PREFLIGHT_SCRIPT])
+    return validate_remote_preflight(output, node)
+
+
+def generate_trojan_password() -> str:
+    return secrets.token_urlsafe(36)
+
+
+def validate_server_snapshot(output: str, node: Node) -> dict[str, str]:
+    facts: dict[str, str] = {}
+    for line in output.splitlines():
+        if "=" not in line:
+            raise SafetyError(f"{node.name}: malformed server verification response")
+        key, value = line.split("=", 1)
+        if key in facts or not re.fullmatch(r"[A-Z0-9_]+", key):
+            raise SafetyError(f"{node.name}: malformed server verification response")
+        facts[key] = value
+    required = {
+        "ACTIVE", "ENABLED", "PID", "NRESTARTS", "OWNER", "QUEUE",
+        "CONFIG_MODE", "CONFIG_OWNER", "RENEW_ACTIVE", "RENEW_ENABLED",
+        "SNAPSHOT_ACTIVE", "SNAPSHOT_ENABLED", "CERTMAN_STATUS", "PORT_80", "PORT_18443",
+        "PORT_34384", "TLS_SAN", "CONFIG_SHA256", "CERT_SHA256",
+    }
+    if set(facts) != required:
+        raise SafetyError(f"{node.name}: incomplete server verification response")
+    expected = {
+        "ACTIVE": "active",
+        "ENABLED": "enabled",
+        "NRESTARTS": "0",
+        "OWNER": "xray",
+        "QUEUE": "0/4096",
+        "CONFIG_MODE": "640",
+        "CONFIG_OWNER": "root:xray",
+        "RENEW_ACTIVE": "active",
+        "RENEW_ENABLED": "enabled",
+        "SNAPSHOT_ACTIVE": "active",
+        "SNAPSHOT_ENABLED": "enabled",
+        "CERTMAN_STATUS": "ok",
+        "PORT_80": "0",
+        "PORT_18443": "0",
+        "PORT_34384": "0",
+        "TLS_SAN": "1",
+    }
+    for key, value in expected.items():
+        if facts[key] != value:
+            raise SafetyError(f"{node.name}: server verification failed at {key}")
+    if not facts["PID"].isdigit() or facts["PID"] == "0":
+        raise SafetyError(f"{node.name}: Xray PID is invalid")
+    for key in ("CONFIG_SHA256", "CERT_SHA256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", facts[key]):
+            raise SafetyError(f"{node.name}: {key} is invalid")
+    return facts
+
+
+def same_install_identity(before: dict[str, str], after: dict[str, str]) -> bool:
+    keys = ("PID", "NRESTARTS", "CONFIG_SHA256", "CERT_SHA256")
+    return all(before.get(key) == after.get(key) for key in keys)
+
+
+def server_snapshot(
+    node: Node,
+    *,
+    ssh_runner: Any = run_verified_ssh,
+) -> dict[str, str]:
+    domain = shlex.quote(node.domain)
+    script = f"""set -eu
+domain={domain}
+printf 'ACTIVE=%s\n' "$(systemctl is-active xray.service)"
+printf 'ENABLED=%s\n' "$(systemctl is-enabled xray.service)"
+printf 'PID=%s\n' "$(systemctl show xray.service -p MainPID --value)"
+printf 'NRESTARTS=%s\n' "$(systemctl show xray.service -p NRestarts --value)"
+if ss -H -lntp 'sport = :443' | grep -q '"xray"'; then owner=xray; else owner=unknown; fi
+printf 'OWNER=%s\n' "$owner"
+printf 'QUEUE=%s\n' "$(ss -H -ltn 'sport = :443' | awk 'NR == 1 {{print $2 "/" $3}}')"
+printf 'CONFIG_MODE=%s\n' "$(stat -c '%a' /etc/xray/config.json)"
+printf 'CONFIG_OWNER=%s\n' "$(stat -c '%U:%G' /etc/xray/config.json)"
+printf 'RENEW_ACTIVE=%s\n' "$(systemctl is-active trojan-certman-renew.timer)"
+printf 'RENEW_ENABLED=%s\n' "$(systemctl is-enabled trojan-certman-renew.timer)"
+printf 'SNAPSHOT_ACTIVE=%s\n' "$(systemctl is-active trojan-certman-snapshot.timer)"
+printf 'SNAPSHOT_ENABLED=%s\n' "$(systemctl is-enabled trojan-certman-snapshot.timer)"
+if /usr/local/sbin/trojan-certman status >/dev/null 2>&1; then
+  printf 'CERTMAN_STATUS=ok\n'
+else
+  printf 'CERTMAN_STATUS=failed\n'
+fi
+for port in 80 18443 34384; do
+  count=$(ss -H -ltn "sport = :$port" | wc -l | tr -d ' ')
+  printf 'PORT_%s=%s\n' "$port" "$count"
+done
+if openssl x509 -in /etc/xray/tls/current/fullchain.pem -noout -checkhost "$domain" >/dev/null 2>&1; then
+  printf 'TLS_SAN=1\n'
+else
+  printf 'TLS_SAN=0\n'
+fi
+printf 'CONFIG_SHA256=%s\n' "$(sha256sum /etc/xray/config.json | awk '{{print $1}}')"
+printf 'CERT_SHA256=%s\n' "$(openssl x509 -in /etc/xray/tls/current/fullchain.pem -outform DER | sha256sum | awk '{{print $1}}')"
+"""
+    return validate_server_snapshot(
+        ssh_runner(node, ["sh", "-c", script]), node
+    )
+
+
+def validate_online_certificate(
+    certificate_der: bytes,
+    expected_sha256: str,
+    node: Node,
+) -> str:
+    if not certificate_der:
+        raise SafetyError(f"{node.name}: online TLS certificate is empty")
+    observed = hashlib.sha256(certificate_der).hexdigest()
+    if observed != expected_sha256:
+        raise SafetyError(f"{node.name}: online TLS fingerprint mismatch")
+    return observed
+
+
+def verify_online_tls(node: Node, *, expected_sha256: str) -> str:
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection((node.address, 443), timeout=15) as raw_socket:
+            with context.wrap_socket(raw_socket, server_hostname=node.domain) as tls_socket:
+                certificate_der = tls_socket.getpeercert(binary_form=True)
+    except (OSError, ssl.SSLError):
+        raise SafetyError(f"{node.name}: public TLS handshake failed") from None
+    if not isinstance(certificate_der, bytes):
+        raise SafetyError(f"{node.name}: public TLS certificate is unavailable")
+    return validate_online_certificate(certificate_der, expected_sha256, node)
+
+
+def render_mihomo_config(node: Node, password: str, port: int) -> str:
+    if not password or "\x00" in password:
+        raise SafetyError(f"{node.name}: Trojan password is invalid")
+    if not 1 <= port <= 65535:
+        raise SafetyError("Mihomo test port is invalid")
+    name = json.dumps(f"acceptance-{node.name}")
+    return f"""mixed-port: {port}
+allow-lan: false
+bind-address: \"127.0.0.1\"
+mode: global
+log-level: warning
+ipv6: false
+proxies:
+  - name: {name}
+    type: trojan
+    server: {json.dumps(node.address)}
+    port: 443
+    password: {json.dumps(password)}
+    sni: {json.dumps(node.domain)}
+    skip-cert-verify: false
+    udp: true
+proxy-groups:
+  - name: GLOBAL
+    type: select
+    proxies:
+      - {name}
+rules:
+  - MATCH,GLOBAL
+"""
+
+
+def gcp_ssh_argv(port: int, *, keepalive_seconds: int | None) -> list[str]:
+    nc = shutil.which("nc") or "nc"
+    argv = [
+        "ssh",
+        "-p", "50245",
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", "ConnectTimeout=15",
+        "-o", f"ProxyCommand={nc} -X connect -x 127.0.0.1:{port} %h %p",
+    ]
+    if keepalive_seconds is not None:
+        argv.extend([
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+        ])
+    argv.append("caoziyu@34.31.209.55")
+    if keepalive_seconds is None:
+        argv.append("true")
+    else:
+        argv.extend(["sleep", str(keepalive_seconds)])
+    return argv
+
+
+def _subprocess_env_without_credentials() -> dict[str, str]:
+    return {
+        key: value for key, value in os.environ.items()
+        if not key.startswith("CREDS_") and key != CREDS_CONTEXT_ENV
+    }
+
+
+def run_mihomo_acceptance(
+    node: Node,
+    password: str,
+    *,
+    reconnects: int = 20,
+    soak_seconds: int = 3600,
+) -> None:
+    mihomo = shutil.which("mihomo")
+    if not mihomo:
+        raise SafetyError("Mihomo v1.19.29 is required for isolated acceptance")
+    version = subprocess.run(
+        [mihomo, "-v"], text=True, capture_output=True, check=False,
+        env=_subprocess_env_without_credentials(),
+    )
+    if version.returncode != 0 or "v1.19.29" not in (version.stdout + version.stderr):
+        raise SafetyError("Mihomo must be exactly v1.19.29")
+    port = 17890
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.bind(("127.0.0.1", port))
+    except OSError:
+        raise SafetyError("isolated Mihomo port 127.0.0.1:17890 is occupied") from None
+    finally:
+        probe.close()
+
+    process: subprocess.Popen[bytes] | None = None
+    with tempfile.TemporaryDirectory(prefix="trojan-node-mihomo-") as temp_dir:
+        config_path = pathlib.Path(temp_dir) / "config.yaml"
+        config_path.write_text(render_mihomo_config(node, password, port), encoding="utf-8")
+        os.chmod(config_path, 0o600)
+        try:
+            process = subprocess.Popen(
+                [mihomo, "-d", temp_dir, "-f", str(config_path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=_subprocess_env_without_credentials(),
+            )
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    raise SafetyError(f"{node.name}: isolated Mihomo exited during startup")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+                        break
+                except OSError:
+                    time.sleep(0.2)
+            else:
+                raise SafetyError(f"{node.name}: isolated Mihomo did not become ready")
+
+            proxy_url = f"http://127.0.0.1:{port}"
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+            )
+            try:
+                with opener.open("https://api.ipify.org", timeout=20) as response:
+                    exit_ip = response.read(128).decode().strip()
+            except (OSError, urllib.error.URLError):
+                raise SafetyError(f"{node.name}: proxy exit verification failed") from None
+            if exit_ip != node.address:
+                raise SafetyError(f"{node.name}: proxy exit IP does not match node")
+
+            for attempt in range(1, reconnects + 1):
+                completed = subprocess.run(
+                    gcp_ssh_argv(port, keepalive_seconds=None),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=_subprocess_env_without_credentials(),
+                )
+                if completed.returncode != 0:
+                    raise SafetyError(
+                        f"{node.name}: GCP SSH reconnect {attempt}/{reconnects} failed"
+                    )
+            try:
+                soak = subprocess.run(
+                    gcp_ssh_argv(port, keepalive_seconds=soak_seconds),
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    timeout=soak_seconds + 120,
+                    env=_subprocess_env_without_credentials(),
+                )
+            except subprocess.TimeoutExpired:
+                raise SafetyError(f"{node.name}: GCP SSH keepalive timed out") from None
+            if soak.returncode != 0:
+                raise SafetyError(f"{node.name}: GCP SSH keepalive failed")
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+
+
+def _require_manager(bundle: SecretBundle) -> str:
+    if not bundle.manager_token:
+        raise SafetyError("Cloudflare manager credential is unavailable")
+    return bundle.manager_token
+
+
+def _permission_groups(client: CloudflareClient) -> dict[str, str]:
+    return resolve_permission_groups(
+        client.list_paginated("/user/tokens/permission_groups")
+    )
+
+
+def rotate_node_credentials(
+    client: CloudflareClient,
+    manifest: Manifest,
+    node: Node,
+    zone_id: str,
+) -> SecretBundle:
+    password = generate_trojan_password()
+    store_credential_field(manifest, node, "password", password)
+    _, node_token = rotate_dns_token(
+        client, manifest, node, zone_id, _permission_groups(client)
+    )
+    if credentials_status(manifest, node) != {
+        "password": "PRESENT", "cloudflare-token": "PRESENT"
+    }:
+        raise SafetyError(f"{node.name}: credential presence readback failed")
+    return SecretBundle(None, password, node_token)
+
+
+def _token_metadata(tokens: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    fields = ("id", "name", "status", "issued_on", "modified_on", "expires_on")
+    return [
+        {field: token[field] for field in fields if field in token}
+        for token in tokens
+    ]
+
+
+def execute_command(
+    args: argparse.Namespace,
+    manifest: Manifest,
+    bundle: SecretBundle,
+    *,
+    reader: Any = input,
+) -> int:
+    node = manifest.nodes[getattr(args, "node", "aiyun")]
+
+    if args.command == "credentials" and args.credentials_command == "status":
+        print(json.dumps({
+            "schemaVersion": 1,
+            "node": node.name,
+            "fields": credentials_status(manifest, node),
+        }, sort_keys=True))
+        return 0
+
+    if args.command == "host":
+        fingerprint = fingerprint_known_host(load_trusted_known_host(node), node)
+        run_verified_ssh(node, ["true"])
+        print(json.dumps({
+            "node": node.name, "ssh": "ok", "fingerprint": fingerprint,
+        }, sort_keys=True))
+        return 0
+
+    if args.command == "verify":
+        if not bundle.password:
+            raise SafetyError(f"{node.name}: Trojan password is unavailable")
+        snapshot = server_snapshot(node)
+        verify_online_tls(node, expected_sha256=snapshot["CERT_SHA256"])
+        run_mihomo_acceptance(node, bundle.password)
+        print(json.dumps({
+            "node": node.name,
+            "verified": True,
+            "pid": snapshot["PID"],
+            "certificateSha256": snapshot["CERT_SHA256"],
+        }, sort_keys=True))
+        return 0
+
+    manager_token = _require_manager(bundle)
+    client = CloudflareClient(manager_token)
+    warn_manager_token_expiry(client)
+
+    if args.command == "credentials":
+        if not confirm_node(node, reader=reader):
+            raise SafetyError(f"{node.name}: confirmation did not match")
+        zone = resolve_unique_zone(client, manifest.zone)
+        rotate_node_credentials(client, manifest, node, zone["id"])
+        print(json.dumps({"node": node.name, "credentials": "rotated"}, sort_keys=True))
+        return 0
+
+    if args.command == "cloudflare" and args.cloudflare_command == "zones":
+        zones = client.list_paginated("/zones", {"name": manifest.zone})
+        print(json.dumps({"zones": [
+            {key: zone[key] for key in ("id", "name", "status") if key in zone}
+            for zone in zones
+        ]}, sort_keys=True))
+        return 0
+
+    if args.command == "cloudflare" and args.cloudflare_command == "dns":
+        zone = resolve_unique_zone(client, manifest.zone)
+        records = list_node_dns_records(client, zone["id"], node.domain)
+        if args.dns_command == "list":
+            print(json.dumps({"node": node.name, "records": records}, sort_keys=True))
+            return 0
+        plan = plan_dns_change(records, node)
+        if plan["action"] != "noop":
+            if not confirm_node(node, reader=reader):
+                raise SafetyError(f"{node.name}: confirmation did not match")
+            apply_dns_change_with_readback(client, zone["id"], node, plan)
+        print(json.dumps({"node": node.name, "dnsAction": plan["action"]}, sort_keys=True))
+        return 0
+
+    if args.command == "cloudflare" and args.cloudflare_command == "token":
+        matching = [
+            token for token in client.list_tokens()
+            if token.get("name") == node.cloudflare_token_name
+        ]
+        if args.token_command == "list":
+            print(json.dumps({
+                "node": node.name, "tokens": _token_metadata(matching),
+            }, sort_keys=True))
+            return 0
+        if not confirm_node(node, reader=reader):
+            raise SafetyError(f"{node.name}: confirmation did not match")
+        if args.token_command == "revoke":
+            revoked = revoke_named_node_tokens(client, node)
+            print(json.dumps({"node": node.name, "revoked": revoked}, sort_keys=True))
+            return 0
+        zone = resolve_unique_zone(client, manifest.zone)
+        rotate_dns_token(
+            client, manifest, node, zone["id"], _permission_groups(client)
+        )
+        print(json.dumps({"node": node.name, "token": "rotated"}, sort_keys=True))
+        return 0
+
+    if args.command == "preflight":
+        zone = resolve_unique_zone(client, manifest.zone)
+        records = list_node_dns_records(client, zone["id"], node.domain)
+        dns_plan = plan_dns_change(records, node)
+        if dns_plan["action"] != "noop":
+            raise SafetyError(f"{node.name}: DNS is not ready ({dns_plan['action']})")
+        artifact = build_source_archive()
+        remote = run_remote_preflight(node)
+        validate_deployable_remote(node, artifact, remote)
+        print(json.dumps({
+            "node": node.name,
+            "gitCommit": artifact.commit,
+            "archiveSha256": artifact.sha256,
+            "dns": "ready",
+            "remote": remote,
+        }, sort_keys=True))
+        return 0
+
+    if args.command == "deploy":
+        if not args.rotate_secrets and credentials_status(manifest, node) != {
+            "password": "PRESENT", "cloudflare-token": "PRESENT"
+        }:
+            raise SafetyError(f"{node.name}: existing node credentials are incomplete")
+        zone = resolve_unique_zone(client, manifest.zone)
+        records = list_node_dns_records(client, zone["id"], node.domain)
+        dns_plan = plan_dns_change(records, node)
+        artifact = build_source_archive()
+        remote = run_remote_preflight(node)
+        require_rerun_secret_policy(
+            remote, rotate_secrets=args.rotate_secrets, node=node
+        )
+        validate_deployable_remote(node, artifact, remote)
+        plan = build_deployment_plan(
+            node, artifact, dns_plan, rotate_secrets=args.rotate_secrets
+        )
+        print(json.dumps(plan, sort_keys=True))
+        if not args.apply:
+            return 0
+        if not confirm_node(node, reader=reader):
+            raise SafetyError(f"{node.name}: confirmation did not match")
+        apply_dns_change_with_readback(client, zone["id"], node, dns_plan)
+        if args.rotate_secrets:
+            node_bundle = rotate_node_credentials(client, manifest, node, zone["id"])
+        else:
+            if not bundle.password or not bundle.node_token:
+                raise SafetyError(f"{node.name}: existing node credentials are unavailable")
+            node_bundle = bundle
+        password = node_bundle.password
+        node_token = node_bundle.node_token
+        if not password or not node_token:
+            raise SafetyError(f"{node.name}: node credential rotation was incomplete")
+        stage_and_install(
+            node, artifact, password, node_token
+        )
+        before = server_snapshot(node)
+        stage_and_install(
+            node, artifact, password, node_token
+        )
+        after = server_snapshot(node)
+        if not same_install_identity(before, after):
+            raise SafetyError(f"{node.name}: repeated install changed managed identity")
+        verify_online_tls(node, expected_sha256=after["CERT_SHA256"])
+        write_managed_provenance(node, artifact)
+        run_mihomo_acceptance(node, password)
+        print(json.dumps({
+            "node": node.name,
+            "installed": True,
+            "idempotent": True,
+            "pid": after["PID"],
+            "certificateSha256": after["CERT_SHA256"],
+        }, sort_keys=True))
+        return 0
+
+    raise SafetyError("unsupported command")
+
+
+def _add_node(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--node", required=True, choices=NODE_NAMES)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="trojan-node",
+        description="Operate one declared Czyhandsome Xray node at a time.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    credentials = sub.add_parser("credentials")
+    credentials_sub = credentials.add_subparsers(dest="credentials_command", required=True)
+    for name in ("status", "rotate"):
+        command = credentials_sub.add_parser(name)
+        _add_node(command)
+
+    cloudflare = sub.add_parser("cloudflare")
+    cloudflare_sub = cloudflare.add_subparsers(dest="cloudflare_command", required=True)
+    cloudflare_sub.add_parser("zones")
+    dns = cloudflare_sub.add_parser("dns")
+    dns_sub = dns.add_subparsers(dest="dns_command", required=True)
+    for name in ("list", "ensure"):
+        command = dns_sub.add_parser(name)
+        _add_node(command)
+    token = cloudflare_sub.add_parser("token")
+    token_sub = token.add_subparsers(dest="token_command", required=True)
+    for name in ("list", "rotate-dns", "revoke"):
+        command = token_sub.add_parser(name)
+        _add_node(command)
+
+    host = sub.add_parser("host")
+    host_sub = host.add_subparsers(dest="host_command", required=True)
+    check = host_sub.add_parser("check")
+    _add_node(check)
+
+    preflight = sub.add_parser("preflight")
+    _add_node(preflight)
+
+    deploy = sub.add_parser("deploy")
+    _add_node(deploy)
+    deploy.add_argument("--rotate-secrets", action="store_true")
+    deploy.add_argument("--apply", action="store_true")
+
+    verify = sub.add_parser("verify")
+    _add_node(verify)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = build_parser().parse_args(raw_argv)
+    try:
+        manifest = load_manifest()
+        configs = credential_context_files(args)
+        if configs and os.environ.get(CREDS_CONTEXT_ENV) != "1":
+            return run_in_credential_context(manifest, args, raw_argv)
+        node = manifest.nodes[getattr(args, "node", "aiyun")]
+        bundle = consume_secret_bundle(
+            manifest,
+            node,
+            require_manager=(ROOT / "config" / "credentials-manager.json") in configs,
+            require_node=(ROOT / "config" / f"credentials-{node.name}.json") in configs,
+        )
+        return execute_command(args, manifest, bundle)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return 130
+    except SafetyError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
