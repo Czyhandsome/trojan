@@ -206,7 +206,7 @@ def run_verified_ssh(
             "-o", "ConnectTimeout=15",
             f"{node.ssh_user}@{node.address}",
             "--",
-            *remote_argv,
+            shlex.join(remote_argv),
         ]
         run_kwargs: dict[str, Any] = {
             "capture_output": True,

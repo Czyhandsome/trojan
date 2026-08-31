@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shlex
 import subprocess
 import threading
 import tarfile
@@ -646,6 +647,28 @@ class SshTrustTests(unittest.TestCase):
             item for item in ssh_argv if item.startswith("UserKnownHostsFile=")
         )
         self.assertFalse(pathlib.Path(known_hosts_arg.split("=", 1)[1]).exists())
+
+    def test_verified_ssh_quotes_multiline_remote_argv_as_one_command(self):
+        key_line = "aiyun ssh-ed25519 dGVzdC1wdWJsaWMta2V5\n"
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((argv, kwargs))
+            if argv[0] == "ssh-keygen":
+                return subprocess.CompletedProcess(argv, 0, stdout=key_line, stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+        script = "set -eu\nprintf 'OS_ID=%s\\n' ubuntu\n"
+        trojan_node.run_verified_ssh(
+            self.node,
+            ["sh", "-c", script],
+            runner=runner,
+            known_hosts_path=pathlib.Path("/trusted/known_hosts"),
+        )
+
+        ssh_argv = calls[1][0]
+        self.assertEqual(ssh_argv[-2], "--")
+        self.assertEqual(ssh_argv[-1], shlex.join(["sh", "-c", script]))
 
     def test_ssh_failure_is_sanitized(self):
         key_line = "aiyun ssh-ed25519 dGVzdC1wdWJsaWMta2V5\n"
