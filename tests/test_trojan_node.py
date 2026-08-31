@@ -1131,6 +1131,23 @@ class ClientAcceptanceTests(unittest.TestCase):
         self.assertIn(secret, config)
         self.assertNotIn("tun:", config.lower())
 
+    def test_mihomo_version_accepts_current_bugfix_releases(self):
+        self.assertEqual(
+            trojan_node.validate_mihomo_version(
+                "Mihomo Meta 1.19.30 darwin arm64 with go1.26.6"
+            ),
+            (1, 19, 30),
+        )
+
+    def test_mihomo_version_rejects_older_or_unparseable_output(self):
+        for output in (
+            "Mihomo Meta v1.19.28 darwin arm64",
+            "unexpected version output",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(trojan_node.SafetyError):
+                    trojan_node.validate_mihomo_version(output)
+
     def test_gcp_ssh_acceptance_argv_is_proxy_bound_and_secret_free(self):
         reconnect = trojan_node.gcp_ssh_argv(17890, keepalive_seconds=None)
         soak = trojan_node.gcp_ssh_argv(17890, keepalive_seconds=3600)

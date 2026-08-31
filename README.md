@@ -92,7 +92,7 @@ token 的 permission-group ID 每次动态解析，权限固定为精确 zone �
 成功后才撤销同名旧节点 token，不碰其他 token。
 
 服务端验收包含 Xray active/enabled、`NRestarts=0`、443 owner/queue、配置权限、timers、
-SAN/证书指纹和关闭端口。隔离客户端固定 Mihomo `v1.19.29`、
+SAN/证书指纹和关闭端口。隔离客户端要求 Mihomo `v1.19.29` 或更新版本、
 `127.0.0.1:17890`、无 TUN、严格 TLS，随后确认出口 IP、20 次 GCP `:50245` SSH 重连和
 60 分钟 keepalive。它不会修改 Clash Verge。
 

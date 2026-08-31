@@ -34,6 +34,7 @@ NODE_NAMES = ("aiyun", "aiyun2")
 CREDS_CONTEXT_ENV = "TROJAN_NODE_CREDS_CONTEXT"
 PROVENANCE_DIR = "/var/lib/trojan-node"
 PROVENANCE_FILE = PROVENANCE_DIR + "/provenance.json"
+MIN_MIHOMO_VERSION = (1, 19, 29)
 
 
 class SafetyError(Exception):
@@ -1257,6 +1258,20 @@ def _subprocess_env_without_credentials() -> dict[str, str]:
     }
 
 
+def validate_mihomo_version(output: str) -> tuple[int, int, int]:
+    match = re.search(r"\bMihomo Meta v?(\d+)\.(\d+)\.(\d+)\b", output)
+    if not match:
+        raise SafetyError("Mihomo version output is not recognized")
+    version = (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3)),
+    )
+    if version < MIN_MIHOMO_VERSION:
+        raise SafetyError("Mihomo must be v1.19.29 or newer")
+    return version
+
+
 def run_mihomo_acceptance(
     node: Node,
     password: str,
@@ -1266,13 +1281,14 @@ def run_mihomo_acceptance(
 ) -> None:
     mihomo = shutil.which("mihomo")
     if not mihomo:
-        raise SafetyError("Mihomo v1.19.29 is required for isolated acceptance")
+        raise SafetyError("Mihomo v1.19.29 or newer is required for isolated acceptance")
     version = subprocess.run(
         [mihomo, "-v"], text=True, capture_output=True, check=False,
         env=_subprocess_env_without_credentials(),
     )
-    if version.returncode != 0 or "v1.19.29" not in (version.stdout + version.stderr):
-        raise SafetyError("Mihomo must be exactly v1.19.29")
+    if version.returncode != 0:
+        raise SafetyError("Mihomo version check failed")
+    validate_mihomo_version(version.stdout + version.stderr)
     port = 17890
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
