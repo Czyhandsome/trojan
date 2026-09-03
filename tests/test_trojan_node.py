@@ -274,6 +274,7 @@ class ClashProfileRenderTests(unittest.TestCase):
                     self.passwords,
                     output,
                     template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                    mihomo_home=pathlib.Path(temp_dir),
                     runner=lambda *_args, **_kwargs: completed,
                 )
                 self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
@@ -284,6 +285,7 @@ class ClashProfileRenderTests(unittest.TestCase):
                         self.passwords,
                         output,
                         template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        mihomo_home=pathlib.Path(temp_dir),
                         runner=lambda *_args, **_kwargs: completed,
                     )
                 link = pathlib.Path(temp_dir) / "linked.yaml"
@@ -294,6 +296,7 @@ class ClashProfileRenderTests(unittest.TestCase):
                         self.passwords,
                         link,
                         template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        mihomo_home=pathlib.Path(temp_dir),
                         runner=lambda *_args, **_kwargs: completed,
                     )
 
@@ -335,6 +338,7 @@ class ClashProfileRenderTests(unittest.TestCase):
                         self.passwords,
                         output,
                         template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        mihomo_home=pathlib.Path(temp_dir),
                         runner=runner,
                     )
 
