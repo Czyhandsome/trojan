@@ -2,7 +2,7 @@
 
 这是面向个人 Xray/Trojan 节点的部署与运维仓库。服务端唯一管理入口是
 `/usr/local/sbin/trojan-certman`；macOS 上用 `bin/trojan-node` 注册、部署和验收节点。
-每条命令只处理一个节点。
+服务端生命周期命令每次只处理一个节点；`clash render` 只在本机组合客户端配置，不操作服务端。
 
 ## 五分钟 Quick Start
 
@@ -81,6 +81,52 @@ trojan-node node show NODE
 节点 ID、domain、address、credential、Cloudflare token 名和 source CIDR 均要求唯一。
 损坏或冲突的本地配置不会静默回退到仓库配置。
 
+## 生成个人 Clash Profile
+
+仓库提供一个无秘密的个人 Profile 规格
+[`config/clash-profile.json`](config/clash-profile.json) 和可编辑规则模板
+[`config/clash-profile.yaml.tpl`](config/clash-profile.yaml.tpl)。当前生成结果包含：
+
+- `Aiyun1`：引用 node inventory 中的 `aiyun`；
+- `Aiyun2`：引用 node inventory 中的 `aiyun2`；
+- `Solo-green`：使用 profile 规格中的公开连接元数据；
+- `DIRECT`：保留为最后一个手动选项。
+
+默认节点是 `Aiyun1`。三个密码分别来自 `personal` Keychain profile 中的
+`trojan-aiyun/password`、`trojan-aiyun2/password` 和
+`trojan-solo-green/password`。首次使用前，通过 stdin 写入 Solo-green 密码：
+
+```bash
+creds set generic trojan-solo-green password --profile personal --stdin
+```
+
+不要把密码放进命令参数、环境变量、仓库文件或 shell history。生成到一个权限受控的临时目录：
+
+```bash
+OUTPUT_DIR="$(mktemp -d -t trojan-node-clash.XXXXXX)"
+chmod 700 "$OUTPUT_DIR"
+OUTPUT="$OUTPUT_DIR/personal-nodes.yaml"
+
+bin/trojan-node clash render --output "$OUTPUT"
+```
+
+该命令只读取三个 password，不读取 Cloudflare token，不运行 SSH、DNS 或部署操作。它会先以
+`0600` 临时文件生成配置，使用 Clash Verge 现有 geodata 目录调用本机 `mihomo` 做最长 30 秒的
+语法检查，再原子写到尚不存在的 `--output`。
+stdout 只返回 Profile 名、节点名和输出路径的 JSON，不打印配置正文。
+
+在 Clash Verge 中新建本地配置，选择生成的 YAML，并命名为 `Personal Nodes`。Clash Verge
+会把导入文件复制到自己的 profiles 目录，因此导入成功后可以删除临时文件：
+
+```bash
+rm "$OUTPUT"
+rmdir "$OUTPUT_DIR"
+```
+
+后续要调整路由，只编辑 `config/clash-profile.yaml.tpl` 的 `rules:`，再生成一个新的临时
+YAML 并重新导入。新配置逐节点验证通过前，不要删除当前可用 Profile；已导入的 Profile
+不会自动跟随仓库模板变化。
+
 ## 部署与验收
 
 常用命令：
@@ -94,6 +140,7 @@ trojan-node host check --node NODE
 trojan-node preflight --node NODE
 trojan-node deploy --node NODE [--rotate-secrets] [--apply]
 trojan-node verify --node NODE
+trojan-node clash render --output FILE
 ```
 
 `deploy` 默认只在 stdout 打印最终脱敏 JSON 计划；`--apply` 仍会先打印相同计划并要求

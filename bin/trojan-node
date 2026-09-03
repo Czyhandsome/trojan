@@ -33,8 +33,16 @@ from datetime import datetime, timezone
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "config" / "nodes.json"
 LOCAL_MANIFEST = pathlib.Path.home() / ".config" / "trojan-node" / "nodes.json"
+DEFAULT_CLASH_PROFILE_SPEC = ROOT / "config" / "clash-profile.json"
+DEFAULT_CLASH_PROFILE_TEMPLATE = ROOT / "config" / "clash-profile.yaml.tpl"
+DEFAULT_CLASH_HOME = (
+    pathlib.Path.home()
+    / "Library/Application Support/io.github.clash-verge-rev.clash-verge-rev"
+)
 NODE_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 SSH_TARGET_RE = re.compile(r"(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9._:\[\]-]+\Z")
+CLASH_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?\Z")
+CLASH_CREDENTIAL_RE = re.compile(r"trojan-[a-z0-9][a-z0-9-]{0,31}\Z")
 CREDS_CONTEXT_ENV = "TROJAN_NODE_CREDS_CONTEXT"
 PROVENANCE_DIR = "/var/lib/trojan-node"
 PROVENANCE_FILE = PROVENANCE_DIR + "/provenance.json"
@@ -149,6 +157,22 @@ class SecretBundle(NamedTuple):
     manager_token: str | None
     password: str | None
     node_token: str | None
+
+
+class ClashProfileNode(NamedTuple):
+    name: str
+    server: str
+    port: int
+    sni: str
+    credential: str
+
+
+class ClashProfileSpec(NamedTuple):
+    name: str
+    group: str
+    default_node: str
+    include_direct: bool
+    nodes: tuple[ClashProfileNode, ...]
 
 
 class SourceArtifact(NamedTuple):
@@ -294,6 +318,215 @@ def load_manifest(
     except (OSError, json.JSONDecodeError) as exc:
         raise SafetyError(f"cannot load node manifest: {exc}") from None
     return parse_manifest(raw)
+
+
+def _clash_label(obj: dict[str, Any], key: str, context: str) -> str:
+    value = _required_string(obj, key, context)
+    if len(value) > 64 or any(character in value for character in "\r\n\0"):
+        raise SafetyError(f"{context}.{key} is invalid")
+    return value
+
+
+def parse_clash_profile_spec(raw: Any, manifest: Manifest) -> ClashProfileSpec:
+    if not isinstance(raw, dict):
+        raise SafetyError("Clash profile spec must be an object")
+    expected_keys = {
+        "schemaVersion", "profileName", "groupName", "defaultNode",
+        "includeDirect", "nodes",
+    }
+    if set(raw) != expected_keys or raw.get("schemaVersion") != 1:
+        raise SafetyError("unsupported Clash profile spec")
+    raw_nodes = raw.get("nodes")
+    if not isinstance(raw_nodes, list) or not raw_nodes:
+        raise SafetyError("Clash profile spec must contain nodes")
+    include_direct = raw.get("includeDirect")
+    if not isinstance(include_direct, bool):
+        raise SafetyError("Clash profile includeDirect must be boolean")
+
+    nodes: list[ClashProfileNode] = []
+    for index, item in enumerate(raw_nodes):
+        context = f"clash.nodes[{index}]"
+        if not isinstance(item, dict):
+            raise SafetyError(f"{context} must be an object")
+        name = _clash_label(item, "name", context)
+        if "managedNode" in item:
+            if set(item) != {"name", "managedNode"}:
+                raise SafetyError(f"{context} managed node fields are invalid")
+            managed_name = _required_string(item, "managedNode", context)
+            managed = manifest.nodes.get(managed_name)
+            if managed is None:
+                raise SafetyError(f"{context} references unknown managed node")
+            nodes.append(ClashProfileNode(
+                name=name,
+                server=managed.domain,
+                port=443,
+                sni=managed.domain,
+                credential=managed.credential,
+            ))
+            continue
+
+        if set(item) != {"name", "server", "port", "sni", "credential"}:
+            raise SafetyError(f"{context} client-only node fields are invalid")
+        server = _required_string(item, "server", context)
+        sni = _required_string(item, "sni", context)
+        credential = _required_string(item, "credential", context)
+        port = item.get("port")
+        if not CLASH_HOST_RE.fullmatch(server) or not CLASH_HOST_RE.fullmatch(sni):
+            raise SafetyError(f"{context} server or sni is invalid")
+        if not isinstance(port, int) or not 1 <= port <= 65535:
+            raise SafetyError(f"{context}.port is invalid")
+        if not CLASH_CREDENTIAL_RE.fullmatch(credential):
+            raise SafetyError(f"{context}.credential is invalid")
+        nodes.append(ClashProfileNode(name, server, port, sni, credential))
+
+    names = [node.name for node in nodes]
+    credentials = [node.credential for node in nodes]
+    if len(names) != len(set(names)) or len(credentials) != len(set(credentials)):
+        raise SafetyError("Clash profile node names and credentials must be unique")
+    default_node = _clash_label(raw, "defaultNode", "clash")
+    if default_node not in names:
+        raise SafetyError("Clash profile defaultNode must name a configured node")
+    if names[0] != default_node:
+        raise SafetyError("Clash profile defaultNode must be the first node")
+    return ClashProfileSpec(
+        name=_clash_label(raw, "profileName", "clash"),
+        group=_clash_label(raw, "groupName", "clash"),
+        default_node=default_node,
+        include_direct=include_direct,
+        nodes=tuple(nodes),
+    )
+
+
+def load_clash_profile_spec(
+    path: pathlib.Path,
+    manifest: Manifest,
+) -> ClashProfileSpec:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SafetyError(f"cannot load Clash profile spec: {exc}") from None
+    return parse_clash_profile_spec(raw, manifest)
+
+
+def clash_credential_placeholders(
+    profile: ClashProfileSpec,
+) -> dict[str, str]:
+    return {
+        node.name: f"<<secret:generic/{node.credential}/password>>"
+        for node in profile.nodes
+    }
+
+
+def render_clash_profile(
+    profile: ClashProfileSpec,
+    passwords: dict[str, str],
+    template: str,
+) -> str:
+    proxy_marker = "  # @trojan-node:proxies"
+    member_marker = "      # @trojan-node:group-members"
+    if template.splitlines().count(proxy_marker) != 1:
+        raise SafetyError("Clash profile template proxy marker must appear once")
+    if template.splitlines().count(member_marker) != 1:
+        raise SafetyError("Clash profile template group marker must appear once")
+    if template.count(f"  - name: {profile.group}\n") != 1:
+        raise SafetyError("Clash profile template group name does not match spec")
+    if template.count(f"  - MATCH,{profile.group}\n") != 1:
+        raise SafetyError("Clash profile template MATCH target does not match spec")
+
+    expected_credentials = {node.credential for node in profile.nodes}
+    if set(passwords) != expected_credentials:
+        raise SafetyError("Clash profile passwords do not match configured credentials")
+    for credential, password in passwords.items():
+        if not isinstance(password, str) or not password or "\0" in password:
+            raise SafetyError(f"Clash profile password is unavailable for {credential}")
+
+    def scalar(value: str) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    proxy_lines: list[str] = []
+    member_lines: list[str] = []
+    for node in profile.nodes:
+        proxy_lines.extend([
+            f"  - name: {scalar(node.name)}",
+            "    type: trojan",
+            f"    server: {scalar(node.server)}",
+            f"    port: {node.port}",
+            f"    password: {scalar(passwords[node.credential])}",
+            f"    sni: {scalar(node.sni)}",
+            "    skip-cert-verify: false",
+            "    udp: true",
+        ])
+        member_lines.append(f"      - {scalar(node.name)}")
+    if profile.include_direct:
+        member_lines.append('      - "DIRECT"')
+
+    rendered = template.replace(proxy_marker, "\n".join(proxy_lines))
+    rendered = rendered.replace(member_marker, "\n".join(member_lines))
+    return rendered if rendered.endswith("\n") else rendered + "\n"
+
+
+def write_validated_clash_profile(
+    profile: ClashProfileSpec,
+    passwords: dict[str, str],
+    output: pathlib.Path,
+    *,
+    template_path: pathlib.Path = DEFAULT_CLASH_PROFILE_TEMPLATE,
+    mihomo_home: pathlib.Path = DEFAULT_CLASH_HOME,
+    runner: Any = subprocess.run,
+) -> pathlib.Path:
+    output = output.expanduser()
+    if not output.parent.is_dir():
+        raise SafetyError("Clash profile output parent must already exist")
+    try:
+        output.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise SafetyError("Clash profile output already exists")
+    try:
+        template = template_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SafetyError(f"cannot load Clash profile template: {exc}") from None
+    rendered = render_clash_profile(profile, passwords, template)
+    mihomo = shutil.which("mihomo")
+    if not mihomo:
+        raise SafetyError("mihomo is required to validate the Clash profile")
+    if not mihomo_home.is_dir():
+        raise SafetyError("Clash Verge home is required for Mihomo geodata validation")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", suffix=".tmp", dir=output.parent
+    )
+    temporary = pathlib.Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            completed = runner(
+                [mihomo, "-t", "-d", str(mihomo_home), "-f", str(temporary)],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+                env=_subprocess_env_without_credentials(),
+            )
+        except subprocess.TimeoutExpired:
+            raise SafetyError("generated Clash profile validation timed out") from None
+        if completed.returncode != 0:
+            raise SafetyError("generated Clash profile failed Mihomo validation")
+        try:
+            os.link(temporary, output)
+        except FileExistsError:
+            raise SafetyError("Clash profile output already exists") from None
+        return output
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def node_to_raw(node: Node, default_zone: str) -> dict[str, Any]:
@@ -703,10 +936,59 @@ def run_in_credential_context(
         return completed.returncode
 
 
+def run_in_clash_credential_context(
+    profile: ClashProfileSpec,
+    raw_argv: list[str],
+    *,
+    credential_profile: str = "personal",
+    runner: Any = subprocess.run,
+    environ: dict[str, str] | None = None,
+) -> int:
+    with tempfile.TemporaryDirectory(prefix="trojan-node-clash-creds-") as temp_dir:
+        placeholder_path = pathlib.Path(temp_dir) / "passwords.json"
+        placeholder_path.write_text(
+            json.dumps(
+                clash_credential_placeholders(profile),
+                ensure_ascii=False,
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(placeholder_path, 0o600)
+        argv = [
+            "creds", "exec", "--from", str(placeholder_path),
+            "--profile", credential_profile,
+            "--", sys.executable, str(pathlib.Path(__file__).resolve()), *raw_argv,
+        ]
+        source = os.environ if environ is None else environ
+        child_env = {
+            key: value for key, value in source.items()
+            if not key.startswith("CREDS_") and key != CREDS_CONTEXT_ENV
+        }
+        child_env[CREDS_CONTEXT_ENV] = "1"
+        completed = runner(argv, env=child_env, check=False)
+        return completed.returncode
+
+
 def credential_env_key(name: str, field: str) -> str:
     path = f"generic/{name}/{field}"
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").upper()
     return "CREDS_" + normalized
+
+
+def consume_clash_passwords(
+    profile: ClashProfileSpec,
+    *,
+    environ: dict[str, str] | None = None,
+) -> dict[str, str]:
+    source = os.environ if environ is None else environ
+    passwords: dict[str, str] = {}
+    for node in profile.nodes:
+        value = source.pop(credential_env_key(node.credential, "password"), None)
+        if not value:
+            raise SafetyError(f"{node.name}: Trojan password is unavailable")
+        passwords[node.credential] = value
+    return passwords
 
 
 def consume_secret_bundle(
@@ -2227,6 +2509,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     verify = sub.add_parser("verify")
     _add_node(verify)
+
+    clash = sub.add_parser("clash")
+    clash_sub = clash.add_subparsers(dest="clash_command", required=True)
+    clash_render = clash_sub.add_parser("render")
+    clash_render.add_argument("--output", required=True)
     return parser
 
 
@@ -2235,6 +2522,25 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(raw_argv)
     try:
         manifest = load_manifest()
+        if args.command == "clash":
+            profile = load_clash_profile_spec(DEFAULT_CLASH_PROFILE_SPEC, manifest)
+            if os.environ.get(CREDS_CONTEXT_ENV) != "1":
+                return run_in_clash_credential_context(
+                    profile,
+                    raw_argv,
+                    credential_profile=manifest.profile,
+                )
+            passwords = consume_clash_passwords(profile)
+            output = write_validated_clash_profile(
+                profile, passwords, pathlib.Path(args.output)
+            )
+            print(json.dumps({
+                "schemaVersion": 1,
+                "profile": profile.name,
+                "nodes": [node.name for node in profile.nodes],
+                "output": str(output),
+            }, ensure_ascii=False, sort_keys=True))
+            return 0
         require_manager, require_node = credential_context_requirements(args)
         if (require_manager or require_node) and os.environ.get(CREDS_CONTEXT_ENV) != "1":
             return run_in_credential_context(manifest, args, raw_argv)

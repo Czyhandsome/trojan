@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "profileName": "Personal Nodes",
+  "groupName": "节点选择",
+  "defaultNode": "Aiyun1",
+  "includeDirect": true,
+  "nodes": [
+    {
+      "name": "Aiyun1",
+      "managedNode": "aiyun"
+    },
+    {
+      "name": "Aiyun2",
+      "managedNode": "aiyun2"
+    },
+    {
+      "name": "Solo-green",
+      "server": "solo-green.czyhandsome.ink",
+      "port": 443,
+      "sni": "solo-green.czyhandsome.ink",
+      "credential": "trojan-solo-green"
+    }
+  ]
+}
