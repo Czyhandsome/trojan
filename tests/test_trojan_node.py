@@ -51,6 +51,7 @@ class CommandSurfaceTests(unittest.TestCase):
             ("deploy", "--node", "aiyun2"),
             ("deploy", "--node", "aiyun2", "--rotate-secrets", "--apply"),
             ("verify", "--node", "aiyun"),
+            ("clash", "render", "--output", "/tmp/personal-nodes.yaml"),
         ]
         for argv in cases:
             with self.subTest(argv=argv):
@@ -148,6 +149,340 @@ class ManifestTests(unittest.TestCase):
                     local_path=local,
                     bundled_path=ROOT / "config" / "nodes.json",
                 )
+
+
+class ClashProfileSpecTests(unittest.TestCase):
+    def test_bundled_profile_resolves_managed_and_client_only_nodes(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        profile = trojan_node.load_clash_profile_spec(
+            ROOT / "config" / "clash-profile.json", manifest
+        )
+
+        self.assertEqual(profile.name, "Personal Nodes")
+        self.assertEqual(profile.group, "节点选择")
+        self.assertEqual(profile.default_node, "Aiyun1")
+        self.assertTrue(profile.include_direct)
+        self.assertEqual(
+            [node.name for node in profile.nodes],
+            ["Aiyun1", "Aiyun2", "Solo-green"],
+        )
+        self.assertEqual(profile.nodes[0].server, manifest.nodes["aiyun"].domain)
+        self.assertEqual(profile.nodes[1].credential, "trojan-aiyun2")
+        self.assertEqual(profile.nodes[2].credential, "trojan-solo-green")
+
+    def profile_raw(self):
+        return json.loads((ROOT / "config" / "clash-profile.json").read_text())
+
+    def test_profile_rejects_unknown_managed_node(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        raw = self.profile_raw()
+        raw["nodes"][0]["managedNode"] = "unknown"
+        with self.assertRaisesRegex(trojan_node.SafetyError, "unknown managed node"):
+            trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_profile_rejects_duplicate_node_name(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        raw = self.profile_raw()
+        raw["nodes"][1]["name"] = "Aiyun1"
+        with self.assertRaisesRegex(trojan_node.SafetyError, "unique"):
+            trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_profile_rejects_missing_or_nonleading_default_node(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        for default_node, expected in (("missing", "configured"), ("Aiyun2", "first")):
+            raw = self.profile_raw()
+            raw["defaultNode"] = default_node
+            with self.subTest(default_node=default_node):
+                with self.assertRaisesRegex(trojan_node.SafetyError, expected):
+                    trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_profile_sources_contain_no_password_values(self):
+        for path in (
+            ROOT / "config" / "clash-profile.json",
+            ROOT / "config" / "clash-profile.yaml.tpl",
+        ):
+            text = path.read_text()
+            self.assertNotIn("password:", text)
+            self.assertNotIn("<<secret:", text)
+
+
+class ClashProfileRenderTests(unittest.TestCase):
+    def setUp(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        self.profile = trojan_node.load_clash_profile_spec(
+            ROOT / "config" / "clash-profile.json", manifest
+        )
+        self.passwords = {
+            "trojan-aiyun": "first-secret",
+            "trojan-aiyun2": "second-secret",
+            "trojan-solo-green": "third-secret",
+        }
+
+    def test_rendered_profile_has_ordered_nodes_direct_rules_and_strict_tls(self):
+        template = (ROOT / "config" / "clash-profile.yaml.tpl").read_text()
+        rendered = trojan_node.render_clash_profile(
+            self.profile, self.passwords, template
+        )
+
+        positions = [rendered.index(f'name: "{name}"') for name in (
+            "Aiyun1", "Aiyun2", "Solo-green",
+        )]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn('      - "DIRECT"', rendered)
+        self.assertEqual(rendered.count("skip-cert-verify: false"), 3)
+        self.assertEqual(rendered.count("type: trojan"), 3)
+        self.assertIn("- MATCH,节点选择", rendered)
+        self.assertEqual(rendered.count("@trojan-node:"), 0)
+
+    def test_credential_placeholders_request_only_three_passwords(self):
+        placeholders = trojan_node.clash_credential_placeholders(self.profile)
+        self.assertEqual(set(placeholders), {
+            "Aiyun1", "Aiyun2", "Solo-green",
+        })
+        self.assertEqual(
+            placeholders["Solo-green"],
+            "<<secret:generic/trojan-solo-green/password>>",
+        )
+        encoded = json.dumps(placeholders)
+        self.assertNotIn("cloudflare", encoded.lower())
+        self.assertNotIn("token", encoded.lower())
+
+    def test_render_rejects_missing_or_duplicate_template_markers(self):
+        template = (ROOT / "config" / "clash-profile.yaml.tpl").read_text()
+        with self.assertRaisesRegex(trojan_node.SafetyError, "marker"):
+            trojan_node.render_clash_profile(
+                self.profile,
+                self.passwords,
+                template.replace("  # @trojan-node:proxies\n", ""),
+            )
+        with self.assertRaisesRegex(trojan_node.SafetyError, "marker"):
+            trojan_node.render_clash_profile(
+                self.profile,
+                self.passwords,
+                template + "  # @trojan-node:proxies\n",
+            )
+
+    def test_validated_output_is_0600_and_refuses_an_existing_target(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+            with mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ):
+                trojan_node.write_validated_clash_profile(
+                    self.profile,
+                    self.passwords,
+                    output,
+                    template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                    runner=lambda *_args, **_kwargs: completed,
+                )
+                self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+                self.assertIn('name: "Aiyun1"', output.read_text())
+                with self.assertRaisesRegex(trojan_node.SafetyError, "exists"):
+                    trojan_node.write_validated_clash_profile(
+                        self.profile,
+                        self.passwords,
+                        output,
+                        template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        runner=lambda *_args, **_kwargs: completed,
+                    )
+                link = pathlib.Path(temp_dir) / "linked.yaml"
+                link.symlink_to(output)
+                with self.assertRaisesRegex(trojan_node.SafetyError, "exists"):
+                    trojan_node.write_validated_clash_profile(
+                        self.profile,
+                        self.passwords,
+                        link,
+                        template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        runner=lambda *_args, **_kwargs: completed,
+                    )
+
+    def test_validation_failure_removes_output_and_redacts_subprocess_text(self):
+        secret = self.passwords["trojan-aiyun"]
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout=secret, stderr=f"invalid {secret}"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+            with mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ):
+                with self.assertRaises(trojan_node.SafetyError) as caught:
+                    trojan_node.write_validated_clash_profile(
+                        self.profile,
+                        self.passwords,
+                        output,
+                        template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        runner=lambda *_args, **_kwargs: completed,
+                    )
+            self.assertFalse(output.exists())
+            self.assertNotIn(secret, str(caught.exception))
+
+    def test_atomic_install_race_preserves_the_concurrent_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+
+            def runner(_argv, **_kwargs):
+                output.write_text("concurrent owner\n")
+                return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+            with mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ):
+                with self.assertRaisesRegex(trojan_node.SafetyError, "exists"):
+                    trojan_node.write_validated_clash_profile(
+                        self.profile,
+                        self.passwords,
+                        output,
+                        template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        runner=runner,
+                    )
+
+            self.assertEqual(output.read_text(), "concurrent owner\n")
+
+    def test_mihomo_validation_uses_existing_home_and_bounded_timeout(self):
+        observed = {}
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = pathlib.Path(temp_dir) / "clash-home"
+            home.mkdir()
+            output = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+
+            def runner(argv, **kwargs):
+                observed["argv"] = argv
+                observed["timeout"] = kwargs["timeout"]
+                return completed
+
+            with mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ):
+                trojan_node.write_validated_clash_profile(
+                    self.profile,
+                    self.passwords,
+                    output,
+                    template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                    mihomo_home=home,
+                    runner=runner,
+                )
+
+        self.assertEqual(observed["argv"][1:3], ["-t", "-d"])
+        self.assertEqual(observed["argv"][3], str(home))
+        self.assertEqual(observed["timeout"], 30)
+
+    def test_mihomo_timeout_cleans_temporary_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+            with mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ):
+                with self.assertRaisesRegex(trojan_node.SafetyError, "timed out"):
+                    trojan_node.write_validated_clash_profile(
+                        self.profile,
+                        self.passwords,
+                        output,
+                        template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                        mihomo_home=pathlib.Path(temp_dir),
+                        runner=mock.Mock(side_effect=subprocess.TimeoutExpired([], 30)),
+                    )
+            self.assertFalse(output.exists())
+            self.assertEqual(list(pathlib.Path(temp_dir).glob(".*.tmp")), [])
+
+    def test_clash_context_wraps_only_configured_password_placeholders(self):
+        observed = {}
+
+        def runner(argv, **kwargs):
+            observed["argv"] = argv
+            observed["env"] = kwargs["env"]
+            config_index = argv.index("--from") + 1
+            observed["config"] = json.loads(
+                pathlib.Path(argv[config_index]).read_text()
+            )
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        result = trojan_node.run_in_clash_credential_context(
+            self.profile,
+            ["clash", "render", "--output", "/tmp/personal-nodes.yaml"],
+            runner=runner,
+            environ={"CREDS_SHOULD_NOT_LEAK": "bad", "PATH": "/usr/bin"},
+        )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(observed["config"], {
+            "Aiyun1": "<<secret:generic/trojan-aiyun/password>>",
+            "Aiyun2": "<<secret:generic/trojan-aiyun2/password>>",
+            "Solo-green": "<<secret:generic/trojan-solo-green/password>>",
+        })
+        self.assertNotIn("CREDS_SHOULD_NOT_LEAK", observed["env"])
+        self.assertEqual(observed["env"][trojan_node.CREDS_CONTEXT_ENV], "1")
+        self.assertIn("--profile", observed["argv"])
+        self.assertIn("personal", observed["argv"])
+
+    def test_main_renders_metadata_without_secret_values(self):
+        environment = {
+            trojan_node.CREDS_CONTEXT_ENV: "1",
+            trojan_node.credential_env_key("trojan-aiyun", "password"): "first-secret",
+            trojan_node.credential_env_key("trojan-aiyun2", "password"): "second-secret",
+            trojan_node.credential_env_key("trojan-solo-green", "password"): "third-secret",
+        }
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                trojan_node, "write_validated_clash_profile", return_value=target
+            ), mock.patch("sys.stdout", output):
+                result = trojan_node.main([
+                    "clash", "render", "--output", str(target)
+                ])
+
+        self.assertEqual(result, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["profile"], "Personal Nodes")
+        self.assertEqual(payload["nodes"], ["Aiyun1", "Aiyun2", "Solo-green"])
+        for secret in self.passwords.values():
+            self.assertNotIn(secret, output.getvalue())
+
+    def test_main_redacts_sensitive_mihomo_stdout_and_stderr(self):
+        environment = {
+            trojan_node.CREDS_CONTEXT_ENV: "1",
+            trojan_node.credential_env_key("trojan-aiyun", "password"): "first-secret",
+            trojan_node.credential_env_key("trojan-aiyun2", "password"): "second-secret",
+            trojan_node.credential_env_key("trojan-solo-green", "password"): "third-secret",
+        }
+        sensitive_diagnostic = "first-secret second-secret third-secret"
+        completed = subprocess.CompletedProcess(
+            [], 1, stdout=sensitive_diagnostic, stderr=sensitive_diagnostic
+        )
+        original_write = trojan_node.write_validated_clash_profile
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = pathlib.Path(temp_dir) / "personal-nodes.yaml"
+
+            def fail_validation(profile, passwords, output):
+                return original_write(
+                    profile,
+                    passwords,
+                    output,
+                    template_path=ROOT / "config" / "clash-profile.yaml.tpl",
+                    mihomo_home=pathlib.Path(temp_dir),
+                    runner=lambda *_args, **_kwargs: completed,
+                )
+
+            with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(
+                trojan_node.shutil, "which", return_value="/usr/local/bin/mihomo"
+            ), mock.patch.object(
+                trojan_node, "write_validated_clash_profile", side_effect=fail_validation
+            ), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+                result = trojan_node.main([
+                    "clash", "render", "--output", str(target)
+                ])
+
+        self.assertEqual(result, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("failed Mihomo validation", stderr.getvalue())
+        for secret in self.passwords.values():
+            self.assertNotIn(secret, stderr.getvalue())
 
 
 class NodeRegistrationTests(unittest.TestCase):
