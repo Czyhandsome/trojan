@@ -164,7 +164,7 @@ class ClashProfileSpecTests(unittest.TestCase):
         self.assertTrue(profile.include_direct)
         self.assertEqual(
             [node.name for node in profile.nodes],
-            ["Aiyun1", "Aiyun2", "Solo-green"],
+            ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH"],
         )
         self.assertEqual(profile.nodes[0].server, manifest.nodes["aiyun"].domain)
         self.assertEqual(profile.nodes[1].credential, "trojan-aiyun2")
@@ -172,6 +172,86 @@ class ClashProfileSpecTests(unittest.TestCase):
 
     def profile_raw(self):
         return json.loads((ROOT / "config" / "clash-profile.json").read_text())
+
+    def test_profile_accepts_multiple_socks_nodes_without_credentials(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        raw = self.profile_raw()
+        raw["nodes"] = [
+            {"name": "HKP-SSH", "type": "socks5", "server": "127.0.0.1", "port": 1088},
+            {"name": "Other-SOCKS", "type": "socks5", "server": "proxy.example.test", "port": 65535},
+        ]
+        raw["defaultNode"] = "HKP-SSH"
+        profile = trojan_node.parse_clash_profile_spec(raw, manifest)
+        self.assertEqual([node.name for node in profile.nodes], ["HKP-SSH", "Other-SOCKS"])
+        self.assertEqual(trojan_node.clash_credential_placeholders(profile), {})
+
+    def test_socks_profile_rejects_unknown_mixed_or_secret_fields(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        socks = {"name": "Custom", "type": "socks5", "server": "localhost", "port": 1088}
+        additions = {
+            "password": "synthetic-secret", "username": "user", "credential": "trojan-custom",
+            "sni": "proxy.example.test", "managedNode": "aiyun", "udp": True,
+            "unknown": "value",
+        }
+        for field, value in additions.items():
+            with self.subTest(field=field):
+                raw = self.profile_raw()
+                raw["nodes"].append({**socks, field: value})
+                with self.assertRaises(trojan_node.SafetyError) as caught:
+                    trojan_node.parse_clash_profile_spec(raw, manifest)
+                self.assertNotIn("synthetic-secret", str(caught.exception))
+        for missing in socks:
+            with self.subTest(missing=missing):
+                raw = self.profile_raw()
+                raw["nodes"].append({key: value for key, value in socks.items() if key != missing})
+                with self.assertRaises(trojan_node.SafetyError):
+                    trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_socks_profile_rejects_invalid_type_host_and_port(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        invalid = {
+            "type": ["http", "trojan", "SOCKS5", "", None, []],
+            "server": ["", "https://proxy.example.test", "host:1088", "host\nname", None],
+            "port": [True, False, 0, -1, 65536, 1088.0, "1088", None],
+        }
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    raw = self.profile_raw()
+                    socks = {"name": "Custom", "type": "socks5", "server": "localhost", "port": 1088}
+                    socks[field] = value
+                    raw["nodes"].append(socks)
+                    with self.assertRaises(trojan_node.SafetyError):
+                        trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_custom_node_names_cannot_shadow_members_or_group(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        for name in ("Aiyun1", "DIRECT", "REJECT", "PASS", "COMPATIBLE", "GLOBAL", "REJECT-DROP", "节点选择"):
+            with self.subTest(name=name):
+                raw = self.profile_raw()
+                raw["nodes"].append({"name": name, "type": "socks5", "server": "localhost", "port": 1088})
+                with self.assertRaises(trojan_node.SafetyError):
+                    trojan_node.parse_clash_profile_spec(raw, manifest)
+
+    def test_legacy_trojan_profile_still_accepts_original_node_forms(self):
+        manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        raw = self.profile_raw()
+        raw["nodes"] = raw["nodes"][:3]
+        profile = trojan_node.parse_clash_profile_spec(raw, manifest)
+        self.assertEqual([node.name for node in profile.nodes], ["Aiyun1", "Aiyun2", "Solo-green"])
+        self.assertEqual(len(trojan_node.clash_credential_placeholders(profile)), 3)
+        passwords = {
+            "trojan-aiyun": "first-secret", "trojan-aiyun2": "second-secret",
+            "trojan-solo-green": "third-secret",
+        }
+        rendered = trojan_node.render_clash_profile(
+            profile, passwords, (ROOT / "config" / "clash-profile.yaml.tpl").read_text()
+        )
+        self.assertEqual(rendered.count("type: trojan"), 3)
+        self.assertEqual(rendered.count("skip-cert-verify: false"), 3)
+        self.assertNotIn("type: socks5", rendered)
+        self.assertNotIn("HKP-SSH", rendered)
+        self.assertIn("- MATCH,节点选择", rendered)
 
     def test_profile_rejects_unknown_managed_node(self):
         manifest = trojan_node.load_manifest(ROOT / "config" / "nodes.json")
@@ -225,7 +305,7 @@ class ClashProfileRenderTests(unittest.TestCase):
         )
 
         positions = [rendered.index(f'name: "{name}"') for name in (
-            "Aiyun1", "Aiyun2", "Solo-green",
+            "Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH",
         )]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('      - "DIRECT"', rendered)
@@ -233,6 +313,75 @@ class ClashProfileRenderTests(unittest.TestCase):
         self.assertEqual(rendered.count("type: trojan"), 3)
         self.assertIn("- MATCH,节点选择", rendered)
         self.assertEqual(rendered.count("@trojan-node:"), 0)
+
+    def test_socks_render_joins_existing_group_without_trojan_fields(self):
+        rendered = trojan_node.render_clash_profile(
+            self.profile, self.passwords, (ROOT / "config" / "clash-profile.yaml.tpl").read_text()
+        )
+        proxies, groups = rendered.split("proxy-groups:", 1)
+        socks_block = proxies.split('  - name: "HKP-SSH"', 1)[1].split("  - name:", 1)[0]
+        self.assertIn("type: socks5", socks_block)
+        self.assertIn('server: "127.0.0.1"', socks_block)
+        self.assertIn("port: 1088", socks_block)
+        self.assertIn("udp: false", socks_block)
+        for forbidden in ("password:", "sni:", "credential:", "skip-cert-verify:", "username:"):
+            self.assertNotIn(forbidden, socks_block)
+        self.assertIn('      - "HKP-SSH"', groups)
+        self.assertEqual(rendered.count("type: socks5"), 1)
+
+    def test_mixed_profile_consumes_only_trojan_passwords(self):
+        environment = {
+            trojan_node.credential_env_key(credential, "password"): password
+            for credential, password in self.passwords.items()
+        }
+        environment["UNRELATED"] = "preserved"
+        self.assertEqual(
+            trojan_node.consume_clash_passwords(self.profile, environ=environment), self.passwords
+        )
+        self.assertEqual(environment, {"UNRELATED": "preserved"})
+
+    def socks_only_profile(self):
+        raw = json.loads((ROOT / "config" / "clash-profile.json").read_text())
+        raw["nodes"] = [
+            {"name": "HKP-SSH", "type": "socks5", "server": "127.0.0.1", "port": 1088},
+            {"name": "Second-SOCKS", "type": "socks5", "server": "localhost", "port": 1},
+        ]
+        raw["defaultNode"] = "HKP-SSH"
+        return trojan_node.parse_clash_profile_spec(
+            raw, trojan_node.load_manifest(ROOT / "config" / "nodes.json")
+        )
+
+    def test_socks_only_profile_renders_and_consumes_no_passwords(self):
+        profile = self.socks_only_profile()
+        environment = {"UNRELATED": "preserved"}
+        self.assertEqual(trojan_node.consume_clash_passwords(profile, environ=environment), {})
+        self.assertEqual(environment, {"UNRELATED": "preserved"})
+        rendered = trojan_node.render_clash_profile(
+            profile, {}, (ROOT / "config" / "clash-profile.yaml.tpl").read_text()
+        )
+        self.assertEqual(rendered.count("type: socks5"), 2)
+        self.assertEqual(rendered.count("udp: false"), 2)
+        self.assertNotIn("password:", rendered)
+        self.assertIn('      - "HKP-SSH"', rendered)
+        self.assertIn('      - "Second-SOCKS"', rendered)
+
+    def test_socks_only_main_does_not_enter_credential_context(self):
+        profile = self.socks_only_profile()
+        stdout = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = pathlib.Path(temp_dir) / "socks-only.yaml"
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+                trojan_node, "load_clash_profile_spec", return_value=profile
+            ), mock.patch.object(
+                trojan_node, "run_in_clash_credential_context"
+            ) as credential_context, mock.patch.object(
+                trojan_node, "write_validated_clash_profile", return_value=target
+            ) as writer, mock.patch("sys.stdout", stdout):
+                result = trojan_node.main(["clash", "render", "--output", str(target)])
+            credential_context.assert_not_called()
+            writer.assert_called_once_with(profile, {}, target)
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stdout.getvalue())["nodes"], ["HKP-SSH", "Second-SOCKS"])
 
     def test_credential_placeholders_request_only_three_passwords(self):
         placeholders = trojan_node.clash_credential_placeholders(self.profile)
@@ -441,7 +590,9 @@ class ClashProfileRenderTests(unittest.TestCase):
         self.assertEqual(result, 0)
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["profile"], "Personal Nodes")
-        self.assertEqual(payload["nodes"], ["Aiyun1", "Aiyun2", "Solo-green"])
+        self.assertEqual(
+            payload["nodes"], ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH"]
+        )
         for secret in self.passwords.values():
             self.assertNotIn(secret, output.getvalue())
 

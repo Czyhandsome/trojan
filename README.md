@@ -90,6 +90,7 @@ trojan-node node show NODE
 - `Aiyun1`：引用 node inventory 中的 `aiyun`；
 - `Aiyun2`：引用 node inventory 中的 `aiyun2`；
 - `Solo-green`：使用 profile 规格中的公开连接元数据；
+- `HKP-SSH`：连接本机 `127.0.0.1:1088` 的无认证 SOCKS5 隧道；
 - `DIRECT`：保留为最后一个手动选项。
 
 默认节点是 `Aiyun1`。三个密码分别来自 `personal` Keychain profile 中的
@@ -122,6 +123,34 @@ stdout 只返回 Profile 名、节点名和输出路径的 JSON，不打印配�
 rm "$OUTPUT"
 rmdir "$OUTPUT_DIR"
 ```
+
+### 添加自定义 SOCKS5 节点
+
+直接在 `config/clash-profile.json` 的现有 `nodes` 列表中添加：
+
+```json
+{
+  "name": "HKP-SSH",
+  "type": "socks5",
+  "server": "127.0.0.1",
+  "port": 1088
+}
+```
+
+默认规格已包含这条记录，不要重复添加。其他自定义节点使用不同名称即可；生成器按列表顺序
+把它们加入现有选择组，仍默认选择首项 `Aiyun1`。省略 `type` 的现有 Trojan 记录继续兼容。
+自定义类型目前仅支持无认证 SOCKS5，字段严格限于上述四项，`port` 为 1–65535 的整数；
+不接受密码、凭据引用、SSH 参数或任意 YAML 透传。生成的 SOCKS5 节点固定 `udp: false`，
+不会索取额外 Keychain 密码，也不会注册成服务端部署节点。
+
+生成器不启动或检查隧道。选择 `HKP-SSH` 前，必须确认本机 `1088` 能实际代理请求；仅看到
+`autossh` 进程不够。`127.0.0.1` 指的是运行 Clash 的设备，同步到手机不能借此访问 Mac。
+默认规格的 `HKP-SSH` 不可用时，仍可选择其他节点；手动选择组不会自动回退。
+
+现有路由规则不变；若在当前选择组中选中 `HKP-SSH`，兜底流量也会走香港。该出口实测被
+OpenAI API 以地区不支持拒绝，因此不要把它当作 OpenAI 出口。需要按网站固定分流时，仍在
+下述规则模板中将 Google/YouTube 指向 `HKP-SSH`，将 OpenAI 指向你已验证可用的节点；
+特定规则须放在会先命中的宽泛规则和最终 `MATCH` 之前。系统代理/TUN 接管与节点选择是两回事。
 
 后续要调整路由，只编辑 `config/clash-profile.yaml.tpl` 的 `rules:`，再生成一个新的临时
 YAML 并重新导入。新配置逐节点验证通过前，不要删除当前可用 Profile；已导入的 Profile

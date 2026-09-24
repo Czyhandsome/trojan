@@ -165,6 +165,7 @@ class ClashProfileNode(NamedTuple):
     port: int
     sni: str
     credential: str
+    proxy_type: str = "trojan"
 
 
 class ClashProfileSpec(NamedTuple):
@@ -343,12 +344,28 @@ def parse_clash_profile_spec(raw: Any, manifest: Manifest) -> ClashProfileSpec:
     if not isinstance(include_direct, bool):
         raise SafetyError("Clash profile includeDirect must be boolean")
 
+    group = _clash_label(raw, "groupName", "clash")
+    reserved_names = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL", group}
     nodes: list[ClashProfileNode] = []
     for index, item in enumerate(raw_nodes):
         context = f"clash.nodes[{index}]"
         if not isinstance(item, dict):
             raise SafetyError(f"{context} must be an object")
         name = _clash_label(item, "name", context)
+        if name in reserved_names:
+            raise SafetyError(f"{context}.name conflicts with a built-in or profile group")
+        if item.get("type") == "socks5":
+            # Custom nodes are client-only endpoints, never deployment inventory or credentials.
+            if set(item) != {"name", "type", "server", "port"}:
+                raise SafetyError(f"{context} socks5 node fields are invalid")
+            server = _required_string(item, "server", context)
+            port = item.get("port")
+            if not CLASH_HOST_RE.fullmatch(server):
+                raise SafetyError(f"{context}.server is invalid")
+            if type(port) is not int or not 1 <= port <= 65535:
+                raise SafetyError(f"{context}.port is invalid")
+            nodes.append(ClashProfileNode(name, server, port, "", "", "socks5"))
+            continue
         if "managedNode" in item:
             if set(item) != {"name", "managedNode"}:
                 raise SafetyError(f"{context} managed node fields are invalid")
@@ -380,7 +397,7 @@ def parse_clash_profile_spec(raw: Any, manifest: Manifest) -> ClashProfileSpec:
         nodes.append(ClashProfileNode(name, server, port, sni, credential))
 
     names = [node.name for node in nodes]
-    credentials = [node.credential for node in nodes]
+    credentials = [node.credential for node in nodes if node.credential]
     if len(names) != len(set(names)) or len(credentials) != len(set(credentials)):
         raise SafetyError("Clash profile node names and credentials must be unique")
     default_node = _clash_label(raw, "defaultNode", "clash")
@@ -390,7 +407,7 @@ def parse_clash_profile_spec(raw: Any, manifest: Manifest) -> ClashProfileSpec:
         raise SafetyError("Clash profile defaultNode must be the first node")
     return ClashProfileSpec(
         name=_clash_label(raw, "profileName", "clash"),
-        group=_clash_label(raw, "groupName", "clash"),
+        group=group,
         default_node=default_node,
         include_direct=include_direct,
         nodes=tuple(nodes),
@@ -413,7 +430,7 @@ def clash_credential_placeholders(
 ) -> dict[str, str]:
     return {
         node.name: f"<<secret:generic/{node.credential}/password>>"
-        for node in profile.nodes
+        for node in profile.nodes if node.credential
     }
 
 
@@ -433,7 +450,7 @@ def render_clash_profile(
     if template.count(f"  - MATCH,{profile.group}\n") != 1:
         raise SafetyError("Clash profile template MATCH target does not match spec")
 
-    expected_credentials = {node.credential for node in profile.nodes}
+    expected_credentials = {node.credential for node in profile.nodes if node.credential}
     if set(passwords) != expected_credentials:
         raise SafetyError("Clash profile passwords do not match configured credentials")
     for credential, password in passwords.items():
@@ -448,14 +465,20 @@ def render_clash_profile(
     for node in profile.nodes:
         proxy_lines.extend([
             f"  - name: {scalar(node.name)}",
-            "    type: trojan",
+            f"    type: {node.proxy_type}",
             f"    server: {scalar(node.server)}",
             f"    port: {node.port}",
-            f"    password: {scalar(passwords[node.credential])}",
-            f"    sni: {scalar(node.sni)}",
-            "    skip-cert-verify: false",
-            "    udp: true",
         ])
+        if node.proxy_type == "socks5":
+            # ssh -D only forwards TCP; advertising UDP would create a broken route.
+            proxy_lines.append("    udp: false")
+        else:
+            proxy_lines.extend([
+                f"    password: {scalar(passwords[node.credential])}",
+                f"    sni: {scalar(node.sni)}",
+                "    skip-cert-verify: false",
+                "    udp: true",
+            ])
         member_lines.append(f"      - {scalar(node.name)}")
     if profile.include_direct:
         member_lines.append('      - "DIRECT"')
@@ -984,6 +1007,8 @@ def consume_clash_passwords(
     source = os.environ if environ is None else environ
     passwords: dict[str, str] = {}
     for node in profile.nodes:
+        if not node.credential:
+            continue
         value = source.pop(credential_env_key(node.credential, "password"), None)
         if not value:
             raise SafetyError(f"{node.name}: Trojan password is unavailable")
@@ -2524,7 +2549,10 @@ def main(argv: list[str] | None = None) -> int:
         manifest = load_manifest()
         if args.command == "clash":
             profile = load_clash_profile_spec(DEFAULT_CLASH_PROFILE_SPEC, manifest)
-            if os.environ.get(CREDS_CONTEXT_ENV) != "1":
+            if (
+                os.environ.get(CREDS_CONTEXT_ENV) != "1"
+                and clash_credential_placeholders(profile)
+            ):
                 return run_in_clash_credential_context(
                     profile,
                     raw_argv,

@@ -19,6 +19,12 @@
       "port": 443,
       "sni": "solo-green.czyhandsome.ink",
       "credential": "trojan-solo-green"
+    },
+    {
+      "name": "HKP-SSH",
+      "type": "socks5",
+      "server": "127.0.0.1",
+      "port": 1088
     }
   ]
 }
