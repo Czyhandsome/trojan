@@ -164,7 +164,7 @@ class ClashProfileSpecTests(unittest.TestCase):
         self.assertTrue(profile.include_direct)
         self.assertEqual(
             [node.name for node in profile.nodes],
-            ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH"],
+            ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH", "JPP-SSH"],
         )
         self.assertEqual(profile.nodes[0].server, manifest.nodes["aiyun"].domain)
         self.assertEqual(profile.nodes[1].credential, "trojan-aiyun2")
@@ -305,7 +305,7 @@ class ClashProfileRenderTests(unittest.TestCase):
         )
 
         positions = [rendered.index(f'name: "{name}"') for name in (
-            "Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH",
+            "Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH", "JPP-SSH",
         )]
         self.assertEqual(positions, sorted(positions))
         self.assertIn('      - "DIRECT"', rendered)
@@ -327,7 +327,8 @@ class ClashProfileRenderTests(unittest.TestCase):
         for forbidden in ("password:", "sni:", "credential:", "skip-cert-verify:", "username:"):
             self.assertNotIn(forbidden, socks_block)
         self.assertIn('      - "HKP-SSH"', groups)
-        self.assertEqual(rendered.count("type: socks5"), 1)
+        self.assertIn('      - "JPP-SSH"', groups)
+        self.assertEqual(rendered.count("type: socks5"), 2)
 
     def test_mixed_profile_consumes_only_trojan_passwords(self):
         environment = {
@@ -591,7 +592,7 @@ class ClashProfileRenderTests(unittest.TestCase):
         payload = json.loads(output.getvalue())
         self.assertEqual(payload["profile"], "Personal Nodes")
         self.assertEqual(
-            payload["nodes"], ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH"]
+            payload["nodes"], ["Aiyun1", "Aiyun2", "Solo-green", "HKP-SSH", "JPP-SSH"]
         )
         for secret in self.passwords.values():
             self.assertNotIn(secret, output.getvalue())
