@@ -125,6 +125,11 @@ rm "$OUTPUT"
 rmdir "$OUTPUT_DIR"
 ```
 
+`Personal Nodes` 是本机个人节点 Profile，不是订阅 Profile 的同步源。订阅 URL、节点选择和
+生成后的含凭据 YAML 继续由 Clash Verge 保存在本机；通用规则、`PROXY` 兼容脚本和 JPP-SSH
+启动生命周期由 `~/.claude-sync` 管理。运行 `~/.claude-sync/bootstrap.sh` 后，Clash Verge
+的本地与远程 Profile 都会挂载共享规则；不要把渲染后的 YAML 提交到 Git 或同步到其他设备。
+
 ### 添加自定义 SOCKS5 节点
 
 直接在 `config/clash-profile.json` 的现有 `nodes` 列表中添加：
