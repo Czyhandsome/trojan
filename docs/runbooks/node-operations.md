@@ -157,6 +157,32 @@ rules:
 
 测试完立即清理该临时配置；其中包含 secret。
 
+## 新 Mac 客户端接入（Personal Nodes Profile）
+
+一台新 Mac 要把本仓节点接进 Clash Verge 的成章流程（此前只有上面的碎片命令）：
+
+1. 前置：Clash Verge 已装；Keychain `personal` profile 已有节点密码
+   （`trojan-aiyun` / `trojan-aiyun2` / `trojan-solo-green`，用 `creds` 工具按仓里
+   `config/credentials-manager.json` 的约定导入）；`~/.config/trojan-node/nodes.json`
+   已就位（`0600`，从另一台机器或 `nodes.example.json` 对照补齐，无 secret）。
+2. 渲染无秘密落地的本地 Profile：
+
+   ```bash
+   bin/trojan-node clash render
+   ```
+
+   产物是 `0600` 临时 YAML（mihomo 语法已校验）。在 Clash Verge → 订阅 → 新建本地
+   Profile 导入，命名 `Personal Nodes`。渲染产物含凭据，导入后即删，不入 git、不同步。
+3. 生成的组：`Aiyun1`/`Aiyun2`（Trojan，默认 Aiyun1）、`Solo-green`、
+   `JPP-SSH`（→`127.0.0.1:1089`，由 `~/.claude-sync` 的 launchd agent 保活）、
+   `HKP-SSH`（→`127.0.0.1:1088`）、`DIRECT`。
+   **HKP-SSH 默认不可用**（2026-10-15 决定不配守护）：仅在需要香港出口时手动跑
+   `hkpon` alias 起隧道，且 OpenAI 拒绝香港出口。
+4. 验证：Clash 面板对 Aiyun1/JPP-SSH 测延迟；`curl -x http://127.0.0.1:7890
+   https://www.gstatic.com/generate_204 -o /dev/null -w '%{http_code}\n'` 得 204。
+
+跨设备网络总图（分层/设备矩阵/降级链）见 `~/.mac-guidebook/context/domains/networking.md`。
+
 ## 改配置前检查与受控重启
 
 不要直接修改 `/etc/xray/config.json` 后盲目 restart。先做精确备份和语法检查：
